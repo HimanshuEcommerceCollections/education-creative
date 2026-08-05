@@ -45,14 +45,72 @@ it never connects. `db:migrate` and `db:studio` need a live database.
 Port 4100, not 4000, because another local project already holds 4000. If you
 change `PORT`, change `API_BASE_URL` in `client/.env.local` to match.
 
+## Email
+
+Business logic only ever sees the `EmailService` interface, so the provider is a
+config choice. `EMAIL_DRIVER` selects one of four:
+
+| Driver | Transport | Use it for |
+|---|---|---|
+| `console` | none — prints to stdout | Local development. Verification and invite links appear in the terminal, so flows can be completed without an inbox. Rejected in production. |
+| `smtp` | SMTP (587/465) | **Gmail** (current), plus SES-over-SMTP, Mailgun, Brevo, Postmark, Mailpit |
+| `resend` | HTTPS (443) | Resend's REST API |
+| `ses` | HTTPS (443) | AWS SES v2 API |
+
+Each provider's SDK is imported lazily inside its driver, so choosing Gmail never
+loads the AWS SDK, and vice versa. Adding a provider is one file implementing
+`EmailService` plus one case in the factory — nothing else needs to know.
+
+### Gmail setup
+
+```
+EMAIL_DRIVER=smtp
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_SECURE=false
+SMTP_USER=you@gmail.com
+SMTP_PASSWORD=<16-character App Password>
+EMAIL_FROM="Your Learning Journey <you@gmail.com>"
+```
+
+Four things that trip people up, all of which the config now handles or explains:
+
+1. **`SMTP_PASSWORD` must be an App Password**, not your Google password — create
+   one at <https://myaccount.google.com/apppasswords> (needs 2-Step Verification).
+   Google displays it in groups of four; the spaces are stripped for you.
+2. **`EMAIL_FROM` must be the same address as `SMTP_USER`.** Gmail rewrites or
+   rejects anything else.
+3. **Port and TLS must agree** — 587 with `SMTP_SECURE=false`, 465 with `true`.
+   Boot fails if they disagree, rather than hanging on connect.
+4. **Limits:** roughly 500 messages/day on consumer Gmail, 2,000 on Workspace.
+   Fine for launch volume; move to SES or Resend before it isn't.
+
+**Gmail SMTP needs outbound 587/465, which some hosts block** — Render's free tier
+among them. If deployment hits that wall, switch `EMAIL_DRIVER` to `resend` or
+`ses`; both use HTTPS on 443 and need no code changes.
+
+Test the configuration before trusting it:
+
+```bash
+npm run email:test                      # authenticate only, sends nothing
+npm run email:test -- you@example.com   # then send a real message
+```
+
+It distinguishes bad credentials from a blocked port from a rejected sender, and
+prints the fix for each.
+
 ## Checks
 
 No database needed:
 
 ```bash
-npx tsx scripts/smoke.ts         # boot, validation, auth gates      (10 checks)
-npx tsx scripts/crypto-check.ts  # argon2 / TOTP / encryption / roles (31 checks)
+npx tsx scripts/env-check.ts     # per-driver email + production guards (15 checks)
+npx tsx scripts/smoke.ts         # boot, validation, auth gates         (10 checks)
+npx tsx scripts/crypto-check.ts  # argon2 / TOTP / encryption / roles   (31 checks)
 ```
+
+`smoke` and `crypto-check` boot the real config, so run them with
+`EMAIL_DRIVER=console` if your SMTP credentials aren't filled in yet.
 
 Against a real database — start the API with its output redirected first, since
 these scrape emailed tokens from the console email driver:
@@ -176,10 +234,13 @@ are recorded here for anyone reading the code without it to hand.
    standard PHC format precisely so production on Linux can switch to the native
    package with no password invalidation.
 4. **No Turnstile**, no pg-boss jobs (so no expired-session sweeper yet), no Redis
-   cache, no Sentry, no Google OAuth, and no SMTP driver — declaring
-   `EMAIL_DRIVER=smtp` throws rather than silently sending nothing.
-5. **The checks are scripts, not a test suite.** They assert real behaviour and
+   cache, no Sentry, and no Google OAuth.
+5. **Email sends are not retried.** A provider outage during signup means the
+   account is created but the verification email is lost — deliberately, so a
+   provider failure can't roll back an account. Recovery today is the
+   "resend confirmation" path on `/account`; a durable outbox belongs with pg-boss.
+6. **The checks are scripts, not a test suite.** They assert real behaviour and
    pass, but there's no runner, no CI wiring, and no fixture teardown.
-6. **`drizzle-kit` pulls a moderate-severity advisory** via `esbuild` in its dev
+7. **`drizzle-kit` pulls a moderate-severity advisory** via `esbuild` in its dev
    dependency chain. It is a build-time tool not on any request path, and the
    `npm audit fix` remedy downgrades to drizzle-kit 0.18. Left as-is knowingly.

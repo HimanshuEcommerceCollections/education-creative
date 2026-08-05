@@ -2,6 +2,7 @@ import { buildApp } from "./app.ts";
 import { closeDatabase } from "./db/client.ts";
 import { env } from "./env.ts";
 import { logger } from "./lib/logger.ts";
+import { emailService } from "./services/email/index.ts";
 
 const app = await buildApp();
 
@@ -13,6 +14,8 @@ async function shutdown(signal: string): Promise<void> {
   logger.info({ signal }, "shutting down");
   try {
     await app.close();
+    // The SMTP driver holds a connection pool; the HTTPS drivers are no-ops here.
+    await emailService.close?.();
     await closeDatabase();
     process.exit(0);
   } catch (error) {

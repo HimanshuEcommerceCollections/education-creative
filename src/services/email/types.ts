@@ -8,10 +8,24 @@ export interface EmailMessage {
 
 /**
  * The one interface business logic may depend on. Drivers are selected by
- * `EMAIL_DRIVER`, so no route or service ever names a provider — swapping
- * Resend for SES is a config change (§3).
+ * `EMAIL_DRIVER`, so no route or service ever names a provider — moving between
+ * Gmail SMTP, Resend, and AWS SES is a config change, not a code change.
+ *
+ * Adding a provider means one new file implementing this and one case in the
+ * factory. Nothing else in the codebase should need to know it exists.
  */
 export interface EmailService {
   readonly name: string;
+
   send(message: EmailMessage): Promise<void>;
+
+  /**
+   * Optional connectivity and credential check that sends nothing. Implemented
+   * where the provider supports it, so `npm run email:test` can distinguish
+   * "credentials are wrong" from "the message was rejected".
+   */
+  verify?(): Promise<void>;
+
+  /** Optional cleanup — SMTP holds a connection pool worth closing on shutdown. */
+  close?(): Promise<void>;
 }
