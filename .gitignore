@@ -1,0 +1,21 @@
+# dependencies
+/node_modules
+
+# build output
+/dist
+
+# env files — never commit real secrets (.env.example is the committed template)
+.env
+.env.*
+!.env.example
+
+# logs
+*.log
+npm-debug.log*
+
+# typescript
+*.tsbuildinfo
+
+# misc
+.DS_Store
+*.pem

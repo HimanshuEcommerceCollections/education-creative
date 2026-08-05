@@ -1,0 +1,125 @@
+import type { FastifyReply, FastifyRequest } from "fastify";
+import fp from "fastify-plugin";
+
+import { type UserRole, isStaffRole } from "../contracts/roles.ts";
+import { env } from "../env.ts";
+import { AppError } from "../lib/app-error.ts";
+import {
+  type AuthenticatedPrincipal,
+  isFullyAuthenticated,
+  resolveSession,
+  touchSession,
+} from "../services/session.service.ts";
+
+declare module "fastify" {
+  interface FastifyRequest {
+    /** Set by `authenticate`; absent on public routes. */
+    principal?: AuthenticatedPrincipal;
+  }
+}
+
+function bearerToken(request: FastifyRequest): string | null {
+  const header = request.headers.authorization;
+  if (!header?.startsWith("Bearer ")) return null;
+  const token = header.slice("Bearer ".length).trim();
+  return token.length > 0 ? token : null;
+}
+
+/**
+ * Resolves the session and attaches the principal. **This is the enforcement
+ * point** — the Next app's `proxy.ts` only checks whether a cookie exists, for
+ * redirects, and is never trusted for access decisions.
+ */
+async function authenticate(request: FastifyRequest, _reply: FastifyReply): Promise<void> {
+  const token = bearerToken(request);
+  if (!token) {
+    throw new AppError("unauthenticated", "Sign in to continue.");
+  }
+
+  const principal = await resolveSession(token);
+  if (!principal) {
+    throw new AppError("unauthenticated", "Your session has expired. Sign in again.");
+  }
+
+  request.principal = principal;
+
+  // Slide the idle window. Deliberately not awaited: it must not add latency to
+  // every authenticated request, and a lost touch only shortens a session.
+  void touchSession(principal).catch((error) => {
+    request.log.warn({ err: error }, "failed to extend session idle window");
+  });
+}
+
+/**
+ * Full authentication: a valid session **and** every precondition for acting as
+ * its role. For staff that means TOTP enrolled and satisfied — a staff session
+ * that hasn't cleared its second factor authorises nothing, which is what makes
+ * a single shared login page safe.
+ */
+async function requireFullAuth(
+  request: FastifyRequest,
+  reply: FastifyReply,
+): Promise<void> {
+  await authenticate(request, reply);
+  const principal = request.principal!;
+
+  if (!isFullyAuthenticated(principal, env.MFA_REQUIRED)) {
+    throw new AppError(
+      "mfa_required",
+      principal.mfaEnrolled
+        ? "Enter the code from your authenticator app to continue."
+        : "Set up two-factor authentication to continue.",
+    );
+  }
+}
+
+/**
+ * Capability gate. Fails closed: an unknown role, a roleless principal, or a
+ * staff session short of MFA never reaches the handler.
+ */
+function requireRole(...allowed: UserRole[]) {
+  return async function roleGuard(
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ): Promise<void> {
+    await requireFullAuth(request, reply);
+    const principal = request.principal!;
+
+    // Checked against `activeRole` rather than the full role set: a multi-role
+    // user acts as exactly one role per session.
+    if (!allowed.includes(principal.activeRole)) {
+      throw new AppError("forbidden", "You don't have access to that.");
+    }
+  };
+}
+
+/** Admin or coordinator. Most staff surfaces want this rather than a bare role. */
+const requireStaff = async function staffGuard(
+  request: FastifyRequest,
+  reply: FastifyReply,
+): Promise<void> {
+  await requireFullAuth(request, reply);
+  if (!isStaffRole(request.principal!.activeRole)) {
+    throw new AppError("forbidden", "You don't have access to that.");
+  }
+};
+
+export const authPlugin = fp(
+  async (app) => {
+    app.decorate("authenticate", authenticate);
+    app.decorate("requireFullAuth", requireFullAuth);
+    app.decorate("requireRole", requireRole);
+    app.decorate("requireStaff", requireStaff);
+  },
+  { name: "auth-plugin" },
+);
+
+declare module "fastify" {
+  interface FastifyInstance {
+    /** Valid session only — used by the MFA endpoints, which run pre-MFA. */
+    authenticate: typeof authenticate;
+    requireFullAuth: typeof requireFullAuth;
+    requireRole: typeof requireRole;
+    requireStaff: typeof requireStaff;
+  }
+}
