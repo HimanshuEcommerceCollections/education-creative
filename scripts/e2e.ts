@@ -7,10 +7,11 @@
  * session revocation, and lockout.
  *
  * Email tokens are only stored hashed, so they can't be read back out of the
- * database — they're scraped from the API's console email driver output instead.
- * Point LOG_FILE at the file the API's stdout is redirected to.
+ * database. They're read from the console driver's outbox instead: start the API
+ * with EMAIL_OUTBOX_FILE set, and point this script at the same path.
  *
- *   npx tsx scripts/e2e.ts
+ *   EMAIL_DRIVER=console EMAIL_OUTBOX_FILE=/tmp/outbox.jsonl npx tsx src/server.ts &
+ *   EMAIL_OUTBOX_FILE=/tmp/outbox.jsonl npx tsx scripts/e2e.ts
  *
  * Safe to re-run: it namespaces every address with a timestamp passed in via
  * RUN_ID, so it never collides with a previous run's rows.
@@ -27,8 +28,27 @@ try {
 }
 
 const API = process.env.E2E_API ?? "http://127.0.0.1:4100";
-const LOG_FILE = process.env.LOG_FILE;
+/**
+ * The console driver's JSONL outbox. `LOG_FILE` is still honoured for the older
+ * stdout-scraping approach, but the outbox is authoritative — redirected stdout
+ * turned out not to reliably capture the driver's output.
+ */
+const OUTBOX_FILE = process.env.EMAIL_OUTBOX_FILE ?? process.env.LOG_FILE;
 const RUN = process.env.RUN_ID ?? "local";
+
+/**
+ * Rate limits are keyed on the forwarded client IP, and the limiter is in-memory
+ * with a 10-minute window — so a fixed address means the second run inside that
+ * window is throttled and reports failures that are purely artefacts. Deriving
+ * the last two octets from RUN_ID gives each run its own bucket.
+ */
+const runOctets = (() => {
+  let hash = 0;
+  for (const char of RUN) hash = (hash * 31 + char.charCodeAt(0)) % 65536;
+  return [Math.floor(hash / 256), hash % 256];
+})();
+const CLIENT_IP = `203.0.113.${runOctets[1]}`;
+const LOCKOUT_IP = `198.51.100.${runOctets[0]}`;
 
 const ADMIN_EMAIL = process.env.SEED_ADMIN_EMAIL ?? "admin@yourlearningjourney.test";
 const ADMIN_PASSWORD = process.env.SEED_ADMIN_PASSWORD ?? "";
@@ -67,7 +87,7 @@ async function call<T = any>(
       // Rate limits are keyed on this. Tests that need a fresh bucket — notably
       // the lockout section, which must reach the account threshold before the
       // per-IP limit trips — pass their own address.
-      "x-client-ip": init.ip ?? "203.0.113.42",
+      "x-client-ip": init.ip ?? CLIENT_IP,
       "x-client-user-agent": "e2e-suite/1.0",
     },
     ...(init.body ? { body: JSON.stringify(init.body) } : {}),
@@ -83,19 +103,36 @@ async function call<T = any>(
   return { status: response.status, body };
 }
 
-/** Newest link matching `pathPrefix` in the API's console-driver output. */
+/**
+ * Newest link matching `pathPrefix` from the console driver's outbox.
+ *
+ * Reads the structured `links` array rather than regexing prose, and scans newest
+ * first so a re-run picks up its own token and not a previous run's.
+ */
 function latestEmailLink(pathPrefix: string): string | null {
-  if (!LOG_FILE) return null;
-  let log: string;
+  if (!OUTBOX_FILE) return null;
+
+  let contents: string;
   try {
-    log = readFileSync(LOG_FILE, "utf8");
+    contents = readFileSync(OUTBOX_FILE, "utf8");
   } catch {
     return null;
   }
-  const matches = log.match(
-    new RegExp(`http://localhost:3000${pathPrefix}\\?token=[A-Za-z0-9]+`, "g"),
-  );
-  return matches?.at(-1) ?? null;
+
+  const lines = contents.split("\n").filter((line) => line.trim().length > 0);
+
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    let entry: { links?: string[] };
+    try {
+      entry = JSON.parse(lines[index]!);
+    } catch {
+      continue; // Not an outbox line — tolerate a stale stdout log.
+    }
+    const match = entry.links?.find((link) => link.includes(`${pathPrefix}?token=`));
+    if (match) return match;
+  }
+
+  return null;
 }
 
 function tokenFrom(link: string | null): string | null {
@@ -186,7 +223,7 @@ if (verifyToken) {
   const after = await call("/auth/session", { token: parentToken });
   ok("session now reports the email as verified", after.body?.user?.emailVerified === true);
 } else {
-  ok("verification link captured from the email driver", false, "set LOG_FILE to scrape it");
+  ok("verification link captured from the email driver", false, "set EMAIL_OUTBOX_FILE on both the API and this script");
 }
 
 section("staff login and the review queue");
@@ -307,7 +344,7 @@ if (inviteToken) {
   });
   ok("an educator cannot read the staff queue", educatorQueue.status === 403);
 } else {
-  ok("invite link captured from the email driver", false, "set LOG_FILE to scrape it");
+  ok("invite link captured from the email driver", false, "set EMAIL_OUTBOX_FILE on both the API and this script");
 }
 
 section("password reset revokes every session");
@@ -345,7 +382,7 @@ if (resetToken) {
   });
   ok("the new password works", newPassword.status === 200);
 } else {
-  ok("reset link captured from the email driver", false, "set LOG_FILE to scrape it");
+  ok("reset link captured from the email driver", false, "set EMAIL_OUTBOX_FILE on both the API and this script");
 }
 
 section("logout");
@@ -363,7 +400,7 @@ const lockEmail = `lockout.${RUN}@example.com`;
 // A dedicated address so this section starts with an unused rate-limit bucket;
 // otherwise the per-IP limit trips before the account threshold is reached and
 // the lockout path never runs.
-const lockIp = "198.51.100.7";
+const lockIp = LOCKOUT_IP;
 await call("/auth/signup", {
   body: { fullName: "Lock Target", email: lockEmail, password: PASSWORD, consentGiven: true },
   ip: lockIp,

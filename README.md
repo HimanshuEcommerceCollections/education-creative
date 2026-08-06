@@ -112,22 +112,38 @@ npx tsx scripts/crypto-check.ts  # argon2 / TOTP / encryption / roles   (31 chec
 `smoke` and `crypto-check` boot the real config, so run them with
 `EMAIL_DRIVER=console` if your SMTP credentials aren't filled in yet.
 
-Against a real database — start the API with its output redirected first, since
-these scrape emailed tokens from the console email driver:
+Against a real database. Verification, invite, and reset tokens are stored only as
+hashes, so the suite reads them from the console driver's **outbox** — the API and
+the script must point at the same file:
 
 ```bash
-npx tsx src/server.ts > /tmp/api.log 2>&1 &
-RUN_ID=$(date +%s) LOG_FILE=/tmp/api.log npx tsx scripts/e2e.ts   # 61 checks
-npx tsx scripts/e2e-multirole.ts                                  # 11 checks
+OUTBOX=/tmp/outbox.jsonl
+EMAIL_DRIVER=console EMAIL_OUTBOX_FILE=$OUTBOX npx tsx src/server.ts > /tmp/api.log 2>&1 &
+RUN_ID=$(date +%s) EMAIL_OUTBOX_FILE=$OUTBOX npx tsx scripts/e2e.ts   # 61 checks
+RUN_ID=$(date +%s) npx tsx scripts/e2e-multirole.ts                   # 11 checks
 ```
+
+`EMAIL_OUTBOX_FILE` makes the console driver append every message to a JSONL file.
+It writes live tokens in plaintext, so production boot rejects it. Earlier versions
+scraped the API's redirected stdout instead, which turned out not to capture the
+driver's output reliably — the outbox is authoritative.
+
+Always pass `RUN_ID`. It namespaces the rows *and* derives a per-run client IP, so
+consecutive runs don't share the in-memory rate limiter's 10-minute bucket and
+report throttling as failures.
 
 `e2e.ts` covers signup, the single login page's role-based redirects, email
 verification, the educator application → approval → invite → set-password chain,
 password reset with session revocation, logout, and lockout. `e2e-multirole.ts`
 covers highest-privilege-wins and mid-session role revocation.
 
-Both write real rows, namespaced by `RUN_ID` so re-runs don't collide. Point them at
-a scratch database, not production.
+Both write real rows. Point them at a scratch database, not production.
+
+**Note on overrides:** a real environment variable beats `.env`, so
+`EMAIL_DRIVER=console npm run …` does what it looks like. That precedence is
+restored explicitly in `env.ts` — Node's `process.loadEnvFile()` overwrites
+existing values, which would otherwise let a checked-out `.env` silently override
+what a host injected.
 
 ## Roles
 

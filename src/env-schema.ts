@@ -61,6 +61,13 @@ export const envSchema = z
      */
     EMAIL_DRIVER: z.enum(["console", "smtp", "resend", "ses"]).default("console"),
     EMAIL_FROM: z.string().min(3),
+    /**
+     * Development only. When set, the console driver appends every message to
+     * this path as JSONL so the e2e scripts can read the single-use tokens that
+     * exist nowhere else. Writes live tokens in plaintext, so production boot
+     * rejects it.
+     */
+    EMAIL_OUTBOX_FILE: optionalString(),
 
     // --- smtp -------------------------------------------------------------
     SMTP_HOST: optionalString(),
@@ -162,6 +169,14 @@ export const envSchema = z
           code: "custom",
           path: ["EMAIL_DRIVER"],
           message: "the console driver sends no mail — use smtp, resend, or ses in production",
+        });
+      }
+      if (env.EMAIL_OUTBOX_FILE) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["EMAIL_OUTBOX_FILE"],
+          message:
+            "must not be set in production — it writes live verification and reset tokens to disk",
         });
       }
     }

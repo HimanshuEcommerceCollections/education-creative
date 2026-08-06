@@ -1,14 +1,28 @@
 import { envSchema } from "./env-schema.ts";
 
 /**
- * Loads `.env` using Node's built-in loader (no dotenv dependency). Real
- * deployments inject env vars directly, so a missing file is not an error.
+ * Loads `.env` using Node's built-in loader (no dotenv dependency), then restores
+ * anything that was **already** in the environment.
+ *
+ * That restore matters: `process.loadEnvFile()` overwrites existing values, which
+ * inverts the precedence every deployment platform assumes. A real environment
+ * variable has to beat a checked-out `.env` — otherwise a stray file in the
+ * working directory silently overrides what the host injected, and a one-off
+ * `EMAIL_DRIVER=console npm run …` does nothing at all.
+ *
+ * A missing file is not an error: real deployments inject variables directly.
  */
 function loadEnvFile() {
+  const injected = { ...process.env };
+
   try {
     process.loadEnvFile();
   } catch {
-    // No .env present — env vars come from the platform / secrets broker.
+    return; // No .env — the platform or secrets broker supplies everything.
+  }
+
+  for (const [key, value] of Object.entries(injected)) {
+    if (value !== undefined) process.env[key] = value;
   }
 }
 
