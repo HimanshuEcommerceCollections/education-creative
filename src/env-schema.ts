@@ -35,6 +35,13 @@ const optionalString = () => optionalText(z.string().min(1));
 export const envSchema = z
   .object({
     NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
+    /**
+     * Set by Vercel to "production" | "preview" | "development" for the
+     * deployment itself. Read so the guards below can't be switched off by a
+     * mis-set NODE_ENV — see `isProductionLike`.
+     */
+    VERCEL_ENV: optionalString(),
+    VERCEL: optionalString(),
     PORT: z.coerce.number().int().positive().default(4000),
     LOG_LEVEL: z
       .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])
@@ -166,7 +173,20 @@ export const envSchema = z
       }
     }
 
-    if (env.NODE_ENV === "production") {
+    /**
+     * A real deployment, whatever NODE_ENV happens to say.
+     *
+     * The guards below are the ones that keep staff MFA on, keep a driver that
+     * sends no mail out of production, keep live tokens off disk, and require a
+     * rate limiter that actually holds. Keying them on NODE_ENV alone made all of
+     * them switchable by one mis-set variable — which is exactly what happened on
+     * the first Vercel deployment, where NODE_ENV was not "production" and every
+     * one of these silently stopped applying.
+     */
+    const isProductionLike =
+      env.NODE_ENV === "production" || env.VERCEL_ENV === "production";
+
+    if (isProductionLike) {
       if (!env.MFA_REQUIRED) {
         ctx.addIssue({
           code: "custom",

@@ -178,6 +178,33 @@ check(
   "ok",
 );
 
+console.log("\n— guards can't be bypassed by a mis-set NODE_ENV —");
+/*
+ * This is what the first Vercel deployment actually did: NODE_ENV was not
+ * "production" on a production deployment, so MFA, the mail driver, the outbox,
+ * and the rate limiter all silently stopped being checked.
+ */
+check(
+  "a production Vercel deployment still requires a real limiter",
+  { NODE_ENV: "development", VERCEL_ENV: "production", EMAIL_DRIVER: "resend", RESEND_API_KEY: "re_x", MFA_REQUIRED: "true" },
+  "UPSTASH_REDIS_REST_URL",
+);
+check(
+  "a production Vercel deployment still requires staff MFA",
+  { NODE_ENV: "development", VERCEL_ENV: "production", EMAIL_DRIVER: "resend", RESEND_API_KEY: "re_x", MFA_REQUIRED: "false", UPSTASH_REDIS_REST_URL: "https://x.upstash.io", UPSTASH_REDIS_REST_TOKEN: "t" },
+  "MFA_REQUIRED",
+);
+check(
+  "a production Vercel deployment still refuses the console driver",
+  { NODE_ENV: "development", VERCEL_ENV: "production", EMAIL_DRIVER: "console", MFA_REQUIRED: "true", UPSTASH_REDIS_REST_URL: "https://x.upstash.io", UPSTASH_REDIS_REST_TOKEN: "t" },
+  "EMAIL_DRIVER",
+);
+check(
+  "a Vercel preview deployment is not held to production rules",
+  { NODE_ENV: "development", VERCEL_ENV: "preview", EMAIL_DRIVER: "console" },
+  "ok",
+);
+
 console.log(
   failures === 0 ? "\nAll env validation checks passed.\n" : `\n${failures} failed.\n`,
 );

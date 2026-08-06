@@ -26,15 +26,43 @@ const REDACT_PATHS = [
   "inHomeAddress",
 ];
 
-export const logger = pino({
+const BASE_OPTIONS = {
   level: env.LOG_LEVEL,
   redact: { paths: REDACT_PATHS, censor: "[redacted]" },
-  ...(isDevelopment
-    ? {
+};
+
+/**
+ * Human-readable logs are for a terminal, and only when the transport can
+ * actually work.
+ *
+ * `pino-pretty` runs as a worker thread that resolves its target by module name at
+ * runtime. That resolution fails inside a bundled serverless function — the module
+ * isn't there to find — and pino throws while *constructing the logger*, which
+ * takes the whole process down before any route is reached. It crashed every
+ * request on Vercel with "unable to determine transport target for pino-pretty".
+ *
+ * So: skip it on a serverless platform, and treat a failure to build the pretty
+ * logger as a reason to fall back to JSON rather than to die. A logger must never
+ * be the thing that breaks the service.
+ */
+function createLogger() {
+  const wantsPretty = isDevelopment && !process.env.VERCEL && !process.env.AWS_LAMBDA_FUNCTION_NAME;
+
+  if (wantsPretty) {
+    try {
+      return pino({
+        ...BASE_OPTIONS,
         transport: {
           target: "pino-pretty",
           options: { colorize: true, translateTime: "HH:MM:ss", ignore: "pid,hostname" },
         },
-      }
-    : {}),
-});
+      });
+    } catch {
+      // Fall through to structured JSON, which needs no transport.
+    }
+  }
+
+  return pino(BASE_OPTIONS);
+}
+
+export const logger = createLogger();
