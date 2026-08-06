@@ -9,7 +9,7 @@ import { educatorApplications, educatorProfiles, users } from "../db/schema/inde
 import { AppError } from "../lib/app-error.ts";
 import { createInvitedUser, type RequestContext } from "./auth.service.ts";
 import { recordAudit } from "./audit.service.ts";
-import { emailService } from "./email/index.ts";
+import { trySend } from "./email/index.ts";
 import {
   applicationReceivedTemplate,
   applicationRejectedTemplate,
@@ -75,10 +75,10 @@ export async function submitEducatorApplication(
     return row!.id;
   });
 
-  await emailService.send({
-    ...applicationReceivedTemplate(input.applicantName),
-    to: input.email,
-  });
+  await trySend(
+    { ...applicationReceivedTemplate(input.applicantName), to: input.email },
+    { purpose: "application_received" },
+  );
 
 }
 
@@ -152,10 +152,10 @@ export async function reviewEducatorApplication(
   });
 
   if (input.status === "rejected") {
-    await emailService.send({
-      ...applicationRejectedTemplate(application.applicantName),
-      to: application.email,
-    });
+    await trySend(
+      { ...applicationRejectedTemplate(application.applicantName), to: application.email },
+      { purpose: "application_rejected" },
+    );
   }
 }
 
@@ -260,10 +260,12 @@ export async function approveEducatorApplication(
     return { userId, token, educatorProfileId: profile!.id };
   });
 
-  await emailService.send({
-    ...educatorInviteTemplate(application.applicantName, result.token),
-    to: application.email,
-  });
+  // If this fails the account and profile still exist; the invite token is live
+  // for 7 days, and the logged context is what an operator needs to resend it.
+  await trySend(
+    { ...educatorInviteTemplate(application.applicantName, result.token), to: application.email },
+    { purpose: "educator_invite", userId: result.userId },
+  );
 
   return { userId: result.userId, educatorProfileId: result.educatorProfileId };
 }

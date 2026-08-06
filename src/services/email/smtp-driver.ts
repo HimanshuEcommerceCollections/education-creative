@@ -47,6 +47,17 @@ export class SmtpEmailDriver implements EmailService {
       maxConnections: 3,
       // Gmail throttles aggressively on bursts; keep concurrency modest.
       maxMessages: 50,
+      /*
+       * Explicit, short timeouts. Nodemailer's defaults are minutes long, and a
+       * host that blocks outbound SMTP doesn't refuse the connection — it drops
+       * the packets, so the socket hangs rather than erroring. Left at the
+       * defaults, that turns into a request hanging until the platform's own
+       * function timeout kills it. Ten seconds is far more than a reachable
+       * server needs and fails fast when the port is blocked.
+       */
+      connectionTimeout: 5_000,
+      greetingTimeout: 5_000,
+      socketTimeout: 10_000,
     });
 
     return this.transporter;

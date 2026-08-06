@@ -52,6 +52,74 @@ function createEmailService(): EmailService {
 
 export const emailService = createEmailService();
 
+/**
+ * Hard ceiling on how long a send may delay the request that triggered it.
+ *
+ * The SMTP driver already sets per-stage timeouts, but those bound each stage, not
+ * the total — a black-holed port measured at 21s end to end, which is both a
+ * dreadful signup experience and close enough to a platform function limit to risk
+ * being killed mid-request. This bounds it regardless of what any driver does.
+ */
+const SEND_TIMEOUT_MS = 8_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`email send exceeded ${ms}ms`)),
+      ms,
+    );
+    // The underlying send is abandoned, not cancelled — it may still complete in
+    // the background, which is harmless: the worst case is a duplicate message.
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+/**
+ * Sends without ever throwing. Returns whether it got through.
+ *
+ * Every send in a request path uses this. A provider failure must not fail the
+ * request that triggered it: by the time an email goes out the transaction has
+ * committed, so throwing would return a 500 for an account that *was* created —
+ * and the user then can't retry, because their address is already taken. Worse on
+ * a host that blocks SMTP, where the failure is a connection timeout: the caller
+ * waits for the timeout and then gets an error, on every single signup.
+ *
+ * The logged context is deliberately enough to identify who missed which message,
+ * without recording the body — that contains single-use tokens. Recovery is the
+ * resend paths (`/auth/resend-verification`, `/auth/forgot-password`); a durable
+ * outbox with retries belongs with pg-boss.
+ */
+export async function trySend(
+  message: Parameters<EmailService["send"]>[0],
+  context: { purpose: string; userId?: string },
+): Promise<boolean> {
+  try {
+    await withTimeout(emailService.send(message), SEND_TIMEOUT_MS);
+    return true;
+  } catch (error) {
+    logger.error(
+      {
+        err: error,
+        driver: emailService.name,
+        to: message.to,
+        purpose: context.purpose,
+        userId: context.userId,
+      },
+      "email send failed — the request still succeeded, so the recipient needs a resend",
+    );
+    return false;
+  }
+}
+
 logger.info(
   {
     driver: emailService.name,

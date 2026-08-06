@@ -40,7 +40,7 @@ import {
   verifyTotpCode,
 } from "../lib/totp.ts";
 import { recordAudit, recordAuditDetached } from "./audit.service.ts";
-import { emailService } from "./email/index.ts";
+import { trySend } from "./email/index.ts";
 import {
   passwordResetTemplate,
   verifyEmailTemplate,
@@ -161,10 +161,13 @@ export async function signup(
       throw error;
     });
 
-  // Outside the transaction: a provider outage must not roll back the account.
+  // Outside the transaction: a provider outage must not roll back the account,
+  // and must not fail the response either — the account exists, and the address
+  // is now taken, so a 500 here would leave the user unable to retry.
   await sendTemplate(
     result.user.email,
     verifyEmailTemplate(result.user.fullName, result.verificationToken),
+    { purpose: "email_verification", userId: result.userId },
   );
 
   const principal = await requirePrincipal(result.issued.token);
@@ -471,7 +474,10 @@ export async function resendVerification(email: string): Promise<void> {
   const { token } = await db.transaction((tx) =>
     issueEmailToken(tx, user.id, "email_verification"),
   );
-  await sendTemplate(user.email, verifyEmailTemplate(user.fullName, token));
+  await sendTemplate(user.email, verifyEmailTemplate(user.fullName, token), {
+    purpose: "email_verification_resend",
+    userId: user.id,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -499,7 +505,10 @@ export async function requestPasswordReset(email: string): Promise<void> {
   const { token } = await db.transaction((tx) =>
     issueEmailToken(tx, user.id, "password_reset"),
   );
-  await sendTemplate(user.email, passwordResetTemplate(user.fullName, token));
+  await sendTemplate(user.email, passwordResetTemplate(user.fullName, token), {
+    purpose: "password_reset",
+    userId: user.id,
+  });
 }
 
 /**
@@ -714,10 +723,17 @@ async function requirePrincipal(token: string): Promise<AuthenticatedPrincipal> 
   return principal;
 }
 
-/** Templates carry an empty `to`; the recipient is filled in here. */
+/**
+ * Templates carry an empty `to`; the recipient is filled in here.
+ *
+ * Uses `trySend`, so a provider failure is logged and the request still succeeds —
+ * the account or token has already been committed, and failing the response would
+ * report an error for work that did happen.
+ */
 async function sendTemplate(
   to: string,
   template: { to: string; subject: string; text: string; html?: string },
+  context: { purpose: string; userId?: string },
 ): Promise<void> {
-  await emailService.send({ ...template, to });
+  await trySend({ ...template, to }, context);
 }

@@ -95,6 +95,36 @@ Still not viable on serverless, and unchanged by this: **pg-boss background jobs
 persistent process. Phase 4 will need a worker somewhere regardless of where the
 API lives.
 
+### Keep the function in the same region as the database
+
+`vercel.json` pins `regions: ["iad1"]` (Washington DC) because the Neon database is
+in `us-east-2`. This is not a micro-optimisation — signup issues roughly a dozen
+sequential round trips, so its latency is *multiplied* by the distance between the
+function and the database.
+
+Measured from a development machine ~360 ms from the database:
+
+| | measured | why |
+|---|---|---|
+| `/healthz` | 3 ms | no database |
+| one warm query | ~730 ms | two round trips at ~360 ms |
+| Argon2id hash | ~1,400 ms | pure-JS implementation |
+| bad login (warm) | ~2.0 s | one query plus the timing-equalisation hash |
+| signup (warm) | ~12 s | Argon2id plus ~12 round trips |
+| first request | +3.9 s | connection setup and Neon waking |
+
+Co-located, those round trips cost ~10 ms each instead of ~360 ms, which takes
+signup to roughly 2 s — nearly all of it Argon2id. If you move the database, move
+`regions` with it. `cle1` (Cleveland) is marginally closer to `us-east-2` than
+`iad1`, if you want the last few milliseconds.
+
+**Argon2id is the remaining cost, and it's inflated here.** The pure-JS
+implementation is only used because Windows Application Control blocks
+`@node-rs/argon2`'s native binary on the development machines — on Vercel's Linux
+runtime the native package loads fine and takes ~40 ms instead of ~1,400 ms. Hashes
+are written in standard PHC format specifically so that swap is safe. Worth doing
+before launch; it's the single biggest win available on login and signup.
+
 ## Email
 
 Business logic only ever sees the `EmailService` interface, so the provider is a
