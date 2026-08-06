@@ -7,6 +7,7 @@ import {
   reviewEducatorApplicationSchema,
   submitEducatorApplicationSchema,
 } from "../contracts/educator-applications.ts";
+import { rateLimit } from "../plugins/rate-limit.ts";
 import { requestContext } from "../plugins/request-context.ts";
 import {
   approveEducatorApplication,
@@ -28,7 +29,9 @@ export async function educatorApplicationRoutes(app: FastifyInstance): Promise<v
    */
   app.post(
     "/",
-    { config: { rateLimit: { max: 5, timeWindow: "1 hour" } } },
+    // Its own scope: an applicant shouldn't burn the shared auth budget, and five
+    // applications an hour from one address is already generous.
+    { preHandler: [rateLimit({ max: 5, windowSeconds: 60 * 60, scope: "apply" })] },
     async (request, reply) => {
       const input = submitEducatorApplicationSchema.parse(request.body);
       await submitEducatorApplication(input, requestContext(request));

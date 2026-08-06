@@ -15,6 +15,7 @@ import {
 import { homeForRole } from "../contracts/roles.ts";
 import { env } from "../env.ts";
 import { AppError } from "../lib/app-error.ts";
+import { moderateLimit, strictLimit } from "../plugins/rate-limit.ts";
 import { requestContext } from "../plugins/request-context.ts";
 import {
   acceptInvite,
@@ -38,15 +39,6 @@ import { loadRoles, resolveSession, toSessionResponse } from "../services/sessio
 import { resolveActiveRole } from "../contracts/roles.ts";
 
 /**
- * Rate limits are deliberately tight on the credential endpoints and looser on
- * the ones a legitimate user might retry. In-memory for now: §9 requires a Redis
- * store before this runs on more than one instance, since an in-process counter
- * is trivially bypassed by hitting a different replica.
- */
-const STRICT_LIMIT = { max: 10, timeWindow: "10 minutes" } as const;
-const MODERATE_LIMIT = { max: 30, timeWindow: "10 minutes" } as const;
-
-/**
  * Every route here returns the plaintext session token in the body rather than
  * setting a cookie. The Next BFF is the only thing that owns a cookie; the
  * browser never sees this response.
@@ -57,7 +49,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
   // -------------------------------------------------------------------------
   app.post(
     "/signup",
-    { config: { rateLimit: STRICT_LIMIT } },
+    { preHandler: [strictLimit()] },
     async (request, reply) => {
       const input = signupRequestSchema.parse(request.body);
       const result = await signup(input, requestContext(request));
@@ -68,7 +60,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
   // -------------------------------------------------------------------------
   // Login — the single entry point for all four roles
   // -------------------------------------------------------------------------
-  app.post("/login", { config: { rateLimit: STRICT_LIMIT } }, async (request) => {
+  app.post("/login", { preHandler: [strictLimit()] }, async (request) => {
     const input = loginRequestSchema.parse(request.body);
     return login(input, requestContext(request));
   });
@@ -100,7 +92,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
   app.post(
     "/mfa/enrol",
-    { preHandler: [app.authenticate], config: { rateLimit: STRICT_LIMIT } },
+    { preHandler: [strictLimit(), app.authenticate] },
     async (request) => {
       const { code } = mfaEnrolRequestSchema.parse(request.body);
       const principal = request.principal!;
@@ -116,7 +108,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
   app.post(
     "/mfa/verify",
-    { preHandler: [app.authenticate], config: { rateLimit: STRICT_LIMIT } },
+    { preHandler: [strictLimit(), app.authenticate] },
     async (request) => {
       const { code } = mfaVerifyRequestSchema.parse(request.body);
       const principal = request.principal!;
@@ -135,7 +127,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
   // -------------------------------------------------------------------------
   app.post(
     "/verify-email",
-    { config: { rateLimit: MODERATE_LIMIT } },
+    { preHandler: [moderateLimit()] },
     async (request) => {
       const { token } = verifyEmailRequestSchema.parse(request.body);
       await verifyEmail(token, requestContext(request));
@@ -145,7 +137,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
   app.post(
     "/resend-verification",
-    { config: { rateLimit: STRICT_LIMIT } },
+    { preHandler: [strictLimit()] },
     async (request) => {
       const { email } = resendVerificationRequestSchema.parse(request.body);
       await resendVerification(email);
@@ -159,7 +151,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
   // -------------------------------------------------------------------------
   app.post(
     "/forgot-password",
-    { config: { rateLimit: STRICT_LIMIT } },
+    { preHandler: [strictLimit()] },
     async (request) => {
       const { email } = forgotPasswordRequestSchema.parse(request.body);
       await requestPasswordReset(email);
@@ -169,7 +161,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
   app.post(
     "/reset-password",
-    { config: { rateLimit: STRICT_LIMIT } },
+    { preHandler: [strictLimit()] },
     async (request) => {
       const input = resetPasswordRequestSchema.parse(request.body);
       await resetPassword(input.token, input.password, requestContext(request));
@@ -187,7 +179,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
    */
   app.get(
     "/invite",
-    { config: { rateLimit: MODERATE_LIMIT } },
+    { preHandler: [moderateLimit()] },
     async (request) => {
       const { token } = inviteTokenQuerySchema.parse(request.query);
       const resolved = await peekEmailToken(token, "invite");
@@ -219,7 +211,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
   app.post(
     "/accept-invite",
-    { config: { rateLimit: STRICT_LIMIT } },
+    { preHandler: [strictLimit()] },
     async (request, reply) => {
       const input = acceptInviteRequestSchema.parse(request.body);
       const result = await acceptInvite(input, requestContext(request));

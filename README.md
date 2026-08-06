@@ -45,6 +45,56 @@ it never connects. `db:migrate` and `db:studio` need a live database.
 Port 4100, not 4000, because another local project already holds 4000. If you
 change `PORT`, change `API_BASE_URL` in `client/.env.local` to match.
 
+## Deploying to Vercel
+
+`src/server.ts` runs a listening process (`npm run dev`, or a container on
+Render/Fly/Railway). Vercel invokes a function per request instead, so `api/index.ts`
+is a second entry point that hands raw requests to Fastify without ever calling
+`listen()`. `vercel.json` rewrites every path to it. Both entry points share the
+same `buildApp()`, so there is one application, not two.
+
+```bash
+vercel switch ecommerce-collections   # pick the right scope
+vercel link                            # from this directory
+# set the env vars below, then:
+vercel deploy --prod
+```
+
+Environment variables to set on the project:
+
+| Variable | Value |
+|---|---|
+| `DATABASE_URL` | Neon's **pooled** string (the `-pooler` host) |
+| `WEB_ORIGIN` | the Next app's URL |
+| `SESSION_PEPPER` | fresh 32+ chars, not the development one |
+| `FIELD_ENCRYPTION_KEY` | fresh 32 bytes base64 |
+| `MFA_REQUIRED` | `true` (boot refuses `false` in production) |
+| `EMAIL_DRIVER` | `resend` or `ses` — **not `smtp`**, see below |
+| `RESEND_API_KEY` / `AWS_*` | whichever the driver needs |
+| `EMAIL_FROM` | your sending identity |
+| `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` | from an Upstash database |
+
+`NODE_ENV` is set by Vercel. Don't set `PORT`. Leave `SEED_ADMIN_*` off the
+platform — there's no shell on serverless, so bootstrap the first admin by running
+`npm run seed:admin` locally with `DATABASE_URL` pointed at production.
+
+Three constraints that come with serverless, all enforced at boot so they can't be
+missed:
+
+1. **`EMAIL_DRIVER=smtp` will not work.** Vercel blocks outbound SMTP ports, so
+   Gmail times out. Use `resend` or `ses` — both HTTPS on 443. Gmail stays fine for
+   local development; the driver is per-environment config.
+2. **Rate limiting needs Upstash.** Every request may hit a fresh instance, so an
+   in-process counter protects nothing. Production boot fails without it.
+3. **Use the pooled database endpoint.** A connection per invocation exhausts a
+   direct endpoint; `db/client.ts` also disables prepared statements automatically
+   when it sees a `-pooler` host, since PgBouncer in transaction mode can't hold them.
+
+Still not viable on serverless, and unchanged by this: **pg-boss background jobs**
+(the SLA auto-refund timer, nightly Stripe reconciliation, retention purges) need a
+persistent process. Phase 4 will need a worker somewhere regardless of where the
+API lives.
+
 ## Email
 
 Business logic only ever sees the `EmailService` interface, so the provider is a
@@ -104,9 +154,10 @@ prints the fix for each.
 No database needed:
 
 ```bash
-npx tsx scripts/env-check.ts     # per-driver email + production guards (15 checks)
-npx tsx scripts/smoke.ts         # boot, validation, auth gates         (10 checks)
-npx tsx scripts/crypto-check.ts  # argon2 / TOTP / encryption / roles   (31 checks)
+npx tsx scripts/env-check.ts        # env contract: drivers, prod guards  (22 checks)
+npx tsx scripts/rate-limit-check.ts # limiter windows, isolation, fail-open (9 checks)
+npx tsx scripts/smoke.ts            # boot, validation, auth gates         (10 checks)
+npx tsx scripts/crypto-check.ts     # argon2 / TOTP / encryption / roles   (31 checks)
 ```
 
 `smoke` and `crypto-check` boot the real config, so run them with
@@ -236,8 +287,8 @@ are recorded here for anyone reading the code without it to hand.
 
 ## Known gaps before this is production-ready
 
-1. **Rate limiting is in-memory.** §9 requires a Redis store before more than one
-   instance runs; an in-process counter is bypassed by hitting another replica.
+1. **No Turnstile on the auth forms.** Rate limiting and per-account lockout are in
+   place, but nothing raises the cost of a distributed attempt from many addresses.
 2. **`audit_log` needs a grant.** The code never issues UPDATE/DELETE on it, but
    that is not the same guarantee as the database role being unable to. After the
    first migration, run:
@@ -249,8 +300,8 @@ are recorded here for anyone reading the code without it to hand.
    machines. Costs ~480ms per hash instead of ~40ms. Hashes are written in
    standard PHC format precisely so production on Linux can switch to the native
    package with no password invalidation.
-4. **No Turnstile**, no pg-boss jobs (so no expired-session sweeper yet), no Redis
-   cache, no Sentry, and no Google OAuth.
+4. **No pg-boss jobs** (so no expired-session sweeper yet), no Redis response cache
+   — Redis is used for rate limiting only — no Sentry, and no Google OAuth.
 5. **Email sends are not retried.** A provider outage during signup means the
    account is created but the verification email is lost — deliberately, so a
    provider failure can't roll back an account. Recovery today is the

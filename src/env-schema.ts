@@ -100,6 +100,16 @@ export const envSchema = z
     AWS_SECRET_ACCESS_KEY: optionalString(),
     SES_CONFIGURATION_SET: optionalString(),
 
+    /**
+     * Upstash Redis, over its REST API. Backs the distributed rate limiter.
+     *
+     * Required in production: without it the limiter falls back to an in-process
+     * counter, which multiplies the effective limit by the instance count and is
+     * bypassed entirely on serverless, where each request may hit a fresh process.
+     */
+    UPSTASH_REDIS_REST_URL: optionalText(z.url()),
+    UPSTASH_REDIS_REST_TOKEN: optionalString(),
+
     SEED_ADMIN_EMAIL: optionalText(z.email()),
     SEED_ADMIN_PASSWORD: optionalString(),
     SEED_ADMIN_NAME: optionalString(),
@@ -179,6 +189,28 @@ export const envSchema = z
             "must not be set in production — it writes live verification and reset tokens to disk",
         });
       }
+      // Without a shared store the per-IP limiter is per-process, which on
+      // serverless means effectively no limit at all on the credential endpoints.
+      if (!env.UPSTASH_REDIS_REST_URL || !env.UPSTASH_REDIS_REST_TOKEN) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["UPSTASH_REDIS_REST_URL"],
+          message:
+            "required in production — an in-process rate limiter does not hold across instances, " +
+            "leaving login and password reset effectively unlimited",
+        });
+      }
+    }
+
+    // One Upstash setting without the other is always a mistake.
+    const hasRedisUrl = Boolean(env.UPSTASH_REDIS_REST_URL);
+    const hasRedisToken = Boolean(env.UPSTASH_REDIS_REST_TOKEN);
+    if (hasRedisUrl !== hasRedisToken) {
+      ctx.addIssue({
+        code: "custom",
+        path: [hasRedisUrl ? "UPSTASH_REDIS_REST_TOKEN" : "UPSTASH_REDIS_REST_URL"],
+        message: "set both Upstash values, or neither to use the in-process limiter",
+      });
     }
   });
 

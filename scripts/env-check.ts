@@ -138,17 +138,45 @@ check(
   },
   "MFA_REQUIRED",
 );
+/** Everything production demands, so the "accepted" case stays meaningful. */
+const PRODUCTION = {
+  NODE_ENV: "production",
+  EMAIL_DRIVER: "resend",
+  RESEND_API_KEY: "re_x",
+  MFA_REQUIRED: "true",
+  UPSTASH_REDIS_REST_URL: "https://example.upstash.io",
+  UPSTASH_REDIS_REST_TOKEN: "token",
+};
+
+check("a valid production config is accepted", PRODUCTION, "ok");
+check("console driver is fine in development", { EMAIL_DRIVER: "console" }, "ok");
 check(
-  "a valid production config is accepted",
-  {
-    NODE_ENV: "production",
-    EMAIL_DRIVER: "resend",
-    RESEND_API_KEY: "re_x",
-    MFA_REQUIRED: "true",
-  },
+  "an outbox file is refused in production (it writes live tokens to disk)",
+  { ...PRODUCTION, EMAIL_OUTBOX_FILE: "/tmp/outbox.jsonl" },
+  "EMAIL_OUTBOX_FILE",
+);
+
+console.log("\n— rate limiting —");
+check(
+  "production requires a distributed limiter",
+  { ...PRODUCTION, UPSTASH_REDIS_REST_URL: "", UPSTASH_REDIS_REST_TOKEN: "" },
+  "UPSTASH_REDIS_REST_URL",
+);
+check(
+  "an Upstash url without its token is rejected",
+  { UPSTASH_REDIS_REST_URL: "https://example.upstash.io" },
+  "UPSTASH_REDIS_REST_TOKEN",
+);
+check(
+  "an Upstash token without its url is rejected",
+  { UPSTASH_REDIS_REST_TOKEN: "token" },
+  "UPSTASH_REDIS_REST_URL",
+);
+check(
+  "neither is fine in development (in-process limiter)",
+  { EMAIL_DRIVER: "console" },
   "ok",
 );
-check("console driver is fine in development", { EMAIL_DRIVER: "console" }, "ok");
 
 console.log(
   failures === 0 ? "\nAll env validation checks passed.\n" : `\n${failures} failed.\n`,

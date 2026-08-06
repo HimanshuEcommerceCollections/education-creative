@@ -1,6 +1,5 @@
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
-import rateLimit from "@fastify/rate-limit";
 import Fastify, { type FastifyBaseLogger, type FastifyInstance } from "fastify";
 
 import { env, isProduction } from "./env.ts";
@@ -41,21 +40,13 @@ export async function buildApp(): Promise<FastifyInstance> {
     methods: ["GET", "POST", "PATCH", "DELETE"],
   });
 
-  /**
-   * In-memory limiter. §9 requires a Redis store before this runs on more than
-   * one instance — an in-process counter is bypassed by hitting another replica.
-   * Keyed on the forwarded client IP, since `request.ip` is Vercel's.
+  /*
+   * Rate limiting is applied per-route via the `rateLimit` preHandler in
+   * `plugins/rate-limit.ts`, backed by `RateLimitStore` — Upstash Redis in
+   * production, in-process in development. `@fastify/rate-limit` was removed
+   * because its store is per-process, which silently stops limiting anything
+   * once the service runs on more than one instance.
    */
-  await app.register(rateLimit, {
-    global: false,
-    max: 100,
-    timeWindow: "1 minute",
-    keyGenerator: (request) => {
-      const forwarded = request.headers["x-client-ip"];
-      const clientIp = Array.isArray(forwarded) ? forwarded[0] : forwarded;
-      return clientIp?.trim() || request.ip;
-    },
-  });
 
   await app.register(authPlugin);
   registerErrorHandler(app);
