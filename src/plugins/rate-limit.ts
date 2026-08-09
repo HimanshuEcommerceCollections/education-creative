@@ -37,10 +37,10 @@ function clientKey(request: FastifyRequest): string {
 /**
  * Builds a preHandler that enforces one limit.
  *
- * Replaces `@fastify/rate-limit`, whose default store is per-process — invisible
- * but useless the moment the service runs on more than one instance, which is
- * every request on serverless. Going through `RateLimitStore` means the same code
- * path is exercised in development and production, only the backend differs.
+ * Replaces `@fastify/rate-limit` so the counting lives behind `RateLimitStore`,
+ * which a shared backend can be dropped into without touching a route. Today that
+ * store is in-process, so on serverless the limit holds per instance rather than
+ * globally — see `services/rate-limit/index.ts`.
  */
 export function rateLimit(options: RateLimitOptions) {
   return async function rateLimitGuard(

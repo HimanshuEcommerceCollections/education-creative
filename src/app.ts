@@ -42,10 +42,9 @@ export async function buildApp(): Promise<FastifyInstance> {
 
   /*
    * Rate limiting is applied per-route via the `rateLimit` preHandler in
-   * `plugins/rate-limit.ts`, backed by `RateLimitStore` — Upstash Redis in
-   * production, in-process in development. `@fastify/rate-limit` was removed
-   * because its store is per-process, which silently stops limiting anything
-   * once the service runs on more than one instance.
+   * `plugins/rate-limit.ts`, backed by `RateLimitStore` — an in-process counter
+   * in every environment. `@fastify/rate-limit` was replaced by that indirection
+   * so the store can be swapped for a shared one without touching a route.
    */
 
   await app.register(authPlugin);

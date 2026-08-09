@@ -144,8 +144,6 @@ const PRODUCTION = {
   EMAIL_DRIVER: "resend",
   RESEND_API_KEY: "re_x",
   MFA_REQUIRED: "true",
-  UPSTASH_REDIS_REST_URL: "https://example.upstash.io",
-  UPSTASH_REDIS_REST_TOKEN: "token",
 };
 
 check("a valid production config is accepted", PRODUCTION, "ok");
@@ -156,47 +154,20 @@ check(
   "EMAIL_OUTBOX_FILE",
 );
 
-console.log("\n— rate limiting —");
-check(
-  "production requires a distributed limiter",
-  { ...PRODUCTION, UPSTASH_REDIS_REST_URL: "", UPSTASH_REDIS_REST_TOKEN: "" },
-  "UPSTASH_REDIS_REST_URL",
-);
-check(
-  "an Upstash url without its token is rejected",
-  { UPSTASH_REDIS_REST_URL: "https://example.upstash.io" },
-  "UPSTASH_REDIS_REST_TOKEN",
-);
-check(
-  "an Upstash token without its url is rejected",
-  { UPSTASH_REDIS_REST_TOKEN: "token" },
-  "UPSTASH_REDIS_REST_URL",
-);
-check(
-  "neither is fine in development (in-process limiter)",
-  { EMAIL_DRIVER: "console" },
-  "ok",
-);
-
 console.log("\n— guards can't be bypassed by a mis-set NODE_ENV —");
 /*
  * This is what the first Vercel deployment actually did: NODE_ENV was not
- * "production" on a production deployment, so MFA, the mail driver, the outbox,
- * and the rate limiter all silently stopped being checked.
+ * "production" on a production deployment, so MFA, the mail driver, and the
+ * outbox all silently stopped being checked.
  */
 check(
-  "a production Vercel deployment still requires a real limiter",
-  { NODE_ENV: "development", VERCEL_ENV: "production", EMAIL_DRIVER: "resend", RESEND_API_KEY: "re_x", MFA_REQUIRED: "true" },
-  "UPSTASH_REDIS_REST_URL",
-);
-check(
   "a production Vercel deployment still requires staff MFA",
-  { NODE_ENV: "development", VERCEL_ENV: "production", EMAIL_DRIVER: "resend", RESEND_API_KEY: "re_x", MFA_REQUIRED: "false", UPSTASH_REDIS_REST_URL: "https://x.upstash.io", UPSTASH_REDIS_REST_TOKEN: "t" },
+  { NODE_ENV: "development", VERCEL_ENV: "production", EMAIL_DRIVER: "resend", RESEND_API_KEY: "re_x", MFA_REQUIRED: "false" },
   "MFA_REQUIRED",
 );
 check(
   "a production Vercel deployment still refuses the console driver",
-  { NODE_ENV: "development", VERCEL_ENV: "production", EMAIL_DRIVER: "console", MFA_REQUIRED: "true", UPSTASH_REDIS_REST_URL: "https://x.upstash.io", UPSTASH_REDIS_REST_TOKEN: "t" },
+  { NODE_ENV: "development", VERCEL_ENV: "production", EMAIL_DRIVER: "console", MFA_REQUIRED: "true" },
   "EMAIL_DRIVER",
 );
 check(

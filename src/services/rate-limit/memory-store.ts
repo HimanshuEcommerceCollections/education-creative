@@ -6,12 +6,12 @@ interface Window {
 }
 
 /**
- * In-process fixed-window counter. Correct for a single instance, and therefore
- * **only suitable for development or a single long-lived server** — on more than
- * one instance (or any serverless platform) each process keeps its own count, so
- * the effective limit multiplies by the instance count and an attacker just
- * spreads requests around. `env.ts` refuses to boot with this driver in
- * production.
+ * In-process fixed-window counter, and the only store this app has.
+ *
+ * Exact for a single instance. On more than one (or any serverless platform) each
+ * process keeps its own count, so the effective limit multiplies by the instance
+ * count and a client that spreads requests around is not held. That is a known,
+ * accepted limitation — see the note in `index.ts`.
  */
 export class MemoryRateLimitStore implements RateLimitStore {
   readonly name = "memory";

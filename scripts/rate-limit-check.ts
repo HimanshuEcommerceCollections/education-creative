@@ -1,16 +1,14 @@
 /**
  * Verifies the rate limiter directly, without HTTP or a database.
  *
- * Exercises the in-process store's arithmetic and window expiry, and — when
- * Upstash credentials are present — the same contract against real Redis, so the
- * two drivers are known to behave identically.
+ * Exercises the store's arithmetic, key isolation, and window expiry — the whole
+ * `RateLimitStore` contract, so a future shared backend can be checked by running
+ * this same function against it.
  *
  *   npx tsx scripts/rate-limit-check.ts
  */
 import { MemoryRateLimitStore } from "../src/services/rate-limit/memory-store.ts";
-import { UpstashRateLimitStore } from "../src/services/rate-limit/upstash-store.ts";
 import type { RateLimitStore } from "../src/services/rate-limit/types.ts";
-import { env } from "../src/env.ts";
 
 let failures = 0;
 const ok = (label: string, condition: boolean, detail = "") => {
@@ -18,7 +16,7 @@ const ok = (label: string, condition: boolean, detail = "") => {
   console.log(`${condition ? "PASS" : "FAIL"}  ${label}${detail ? `  (${detail})` : ""}`);
 };
 
-/** A distinct key per run so a real Redis isn't polluted between invocations. */
+/** A distinct key per run, so a shared backend isn't polluted between invocations. */
 const suffix = `${process.pid}-${Math.floor(Math.random() * 1e6)}`;
 
 async function exerciseStore(store: RateLimitStore, label: string) {
@@ -62,27 +60,6 @@ async function exerciseStore(store: RateLimitStore, label: string) {
 }
 
 await exerciseStore(new MemoryRateLimitStore(), "memory store");
-
-if (env.UPSTASH_REDIS_REST_URL && env.UPSTASH_REDIS_REST_TOKEN) {
-  await exerciseStore(
-    new UpstashRateLimitStore(env.UPSTASH_REDIS_REST_URL, env.UPSTASH_REDIS_REST_TOKEN),
-    "upstash store (real Redis)",
-  );
-} else {
-  console.log(
-    "\n— upstash store —\nSKIP  no UPSTASH_REDIS_REST_URL/TOKEN set; only the memory store was checked",
-  );
-}
-
-console.log("\n— failing open —");
-// A store that cannot be reached must allow the request rather than refuse it: a
-// Redis outage should not lock every user out of signing in.
-const brokenStore = new UpstashRateLimitStore(
-  "https://unreachable.invalid",
-  "not-a-real-token",
-);
-const failOpen = await brokenStore.consume(`test:failopen:${suffix}`, 1, 60);
-ok("an unreachable store allows the request", failOpen.allowed);
 
 console.log(
   failures === 0 ? "\nAll rate limit checks passed.\n" : `\n${failures} failed.\n`,

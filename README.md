@@ -72,20 +72,21 @@ Environment variables to set on the project:
 | `EMAIL_DRIVER` | `resend` or `ses` — **not `smtp`**, see below |
 | `RESEND_API_KEY` / `AWS_*` | whichever the driver needs |
 | `EMAIL_FROM` | your sending identity |
-| `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` | from an Upstash database |
 
 `NODE_ENV` is set by Vercel. Don't set `PORT`. Leave `SEED_ADMIN_*` off the
 platform — there's no shell on serverless, so bootstrap the first admin by running
 `npm run seed:admin` locally with `DATABASE_URL` pointed at production.
 
-Three constraints that come with serverless, all enforced at boot so they can't be
-missed:
+Three constraints that come with serverless:
 
 1. **`EMAIL_DRIVER=smtp` will not work.** Vercel blocks outbound SMTP ports, so
    Gmail times out. Use `resend` or `ses` — both HTTPS on 443. Gmail stays fine for
-   local development; the driver is per-environment config.
-2. **Rate limiting needs Upstash.** Every request may hit a fresh instance, so an
-   in-process counter protects nothing. Production boot fails without it.
+   local development; the driver is per-environment config. Enforced at boot.
+2. **Rate limiting is per-instance, not global.** The limiter counts in process
+   memory and every request may hit a fresh instance, so the per-IP budget on the
+   credential endpoints multiplies by however many instances are warm. A shared
+   store was removed deliberately; reinstating one means a new `RateLimitStore`
+   implementation and nothing else.
 3. **Use the pooled database endpoint.** A connection per invocation exhausts a
    direct endpoint; `db/client.ts` also disables prepared statements automatically
    when it sees a `-pooler` host, since PgBouncer in transaction mode can't hold them.
@@ -330,8 +331,9 @@ are recorded here for anyone reading the code without it to hand.
    machines. Costs ~480ms per hash instead of ~40ms. Hashes are written in
    standard PHC format precisely so production on Linux can switch to the native
    package with no password invalidation.
-4. **No pg-boss jobs** (so no expired-session sweeper yet), no Redis response cache
-   — Redis is used for rate limiting only — no Sentry, and no Google OAuth.
+4. **No pg-boss jobs** (so no expired-session sweeper yet), no Redis at all, no
+   Sentry, and no Google OAuth. Rate limiting is an in-process counter, so on
+   serverless the per-IP limit holds per instance rather than globally.
 5. **Email sends are not retried.** A provider outage during signup means the
    account is created but the verification email is lost — deliberately, so a
    provider failure can't roll back an account. Recovery today is the
