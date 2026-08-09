@@ -1,11 +1,9 @@
 /** One-off verification of the crypto primitives. Not part of the build. */
 import { hashPassword, verifyPassword, fakeVerifyDelay } from "../src/lib/password.ts";
 import { encryptField, decryptField } from "../src/lib/crypto-field.ts";
-import { createTotpSecret, encryptTotpSecret, buildTotpUri, verifyTotpCode } from "../src/lib/totp.ts";
 import { generateToken, hashToken, tokensMatch, sha256Hex } from "../src/lib/tokens.ts";
 import { uuidv7 } from "../src/lib/id.ts";
 import { resolveActiveRole, homeForRole } from "../src/contracts/roles.ts";
-import { generateSync } from "otplib";
 
 let fail = 0;
 const ok = (label: string, cond: boolean, extra = "") => {
@@ -37,14 +35,6 @@ ok("field ciphertext differs per call", encryptField(secret) !== encryptField(se
 let tamperCaught = false;
 try { decryptField(enc.slice(0, -4) + "AAAA"); } catch { tamperCaught = true; }
 ok("tampered ciphertext throws (GCM auth tag)", tamperCaught);
-
-const totp = createTotpSecret();
-const encTotp = encryptTotpSecret(totp);
-const liveCode = generateSync({ secret: totp });
-ok("TOTP accepts a live code", await verifyTotpCode(encTotp, liveCode));
-ok("TOTP rejects a wrong code", !(await verifyTotpCode(encTotp, "000000")));
-ok("TOTP rejects a null secret", !(await verifyTotpCode(null, liveCode)));
-ok("otpauth URI is well-formed", buildTotpUri(totp, "admin@example.test").startsWith("otpauth://totp/"));
 
 const tok = generateToken();
 ok("session token is base32, 32 chars", /^[a-z2-7]{32}$/.test(tok), tok);

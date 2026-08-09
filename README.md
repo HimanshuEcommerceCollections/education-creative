@@ -68,7 +68,6 @@ Environment variables to set on the project:
 | `WEB_ORIGIN` | the Next app's URL |
 | `SESSION_PEPPER` | fresh 32+ chars, not the development one |
 | `FIELD_ENCRYPTION_KEY` | fresh 32 bytes base64 |
-| `MFA_REQUIRED` | `true` (boot refuses `false` in production) |
 | `EMAIL_DRIVER` | `resend` or `ses` — **not `smtp`**, see below |
 | `RESEND_API_KEY` / `AWS_*` | whichever the driver needs |
 | `EMAIL_FROM` | your sending identity |
@@ -185,10 +184,10 @@ prints the fix for each.
 No database needed:
 
 ```bash
-npx tsx scripts/env-check.ts        # env contract: drivers, prod guards  (22 checks)
+npx tsx scripts/env-check.ts        # env contract: drivers, prod guards  (18 checks)
 npx tsx scripts/rate-limit-check.ts # limiter windows, isolation, fail-open (9 checks)
 npx tsx scripts/smoke.ts            # boot, validation, auth gates         (10 checks)
-npx tsx scripts/crypto-check.ts     # argon2 / TOTP / encryption / roles   (31 checks)
+npx tsx scripts/crypto-check.ts     # argon2 / encryption / tokens / roles (26 checks)
 ```
 
 `smoke` and `crypto-check` boot the real config, so run them with
@@ -245,9 +244,6 @@ role instead:
 
 - Staff idle window is 45 minutes and **"Remember me" is ignored server-side**
   (`SESSION_POLICY` in `src/constants.ts`).
-- Staff TOTP is a second step in the same flow. A staff session exists after the
-  password check but `mfa_satisfied_at` is null, and `requireFullAuth` **fails
-  closed** on it — the cookie is set but authorises nothing.
 - Multi-role users resolve to their highest privilege
   (`admin > coordinator > educator > customer`), pinned onto `sessions.active_role`
   for the session's life. `resolveActiveRole` in `src/contracts/roles.ts`.
@@ -261,8 +257,6 @@ role instead:
 | POST | `/auth/login` | public (all roles) |
 | GET | `/auth/session` | session |
 | POST | `/auth/logout` · `/auth/logout-everywhere` | session |
-| GET | `/auth/mfa/setup` | session (pre-MFA) |
-| POST | `/auth/mfa/enrol` · `/auth/mfa/verify` | session (pre-MFA) |
 | POST | `/auth/verify-email` · `/auth/resend-verification` | public |
 | POST | `/auth/forgot-password` · `/auth/reset-password` | public |
 | GET | `/auth/invite?token=…` | public (read-only peek) |

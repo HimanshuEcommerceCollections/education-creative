@@ -5,8 +5,6 @@ import {
   type AcceptInviteRequest,
   type LoginRequest,
   type LoginResponse,
-  MFA_SETUP_PATH,
-  MFA_VERIFY_PATH,
   type SignupRequest,
 } from "../contracts/auth.ts";
 import {
@@ -28,17 +26,10 @@ import {
   userRoles,
   users,
 } from "../db/schema/index.ts";
-import { env } from "../env.ts";
 import { AppError, invalidCredentials } from "../lib/app-error.ts";
 import { fakeVerifyDelay, hashPassword, verifyPassword } from "../lib/password.ts";
 import { USERS_EMAIL_CONSTRAINT, isUniqueViolation } from "../lib/pg-errors.ts";
 import { sha256Hex } from "../lib/tokens.ts";
-import {
-  buildTotpUri,
-  createTotpSecret,
-  encryptTotpSecret,
-  verifyTotpCode,
-} from "../lib/totp.ts";
 import { recordAudit, recordAuditDetached } from "./audit.service.ts";
 import { trySend } from "./email/index.ts";
 import {
@@ -50,7 +41,6 @@ import {
   type AuthenticatedPrincipal,
   issueSession,
   loadRoles,
-  markMfaSatisfied,
   resolveSession,
   revokeAllSessionsForUser,
   toSessionResponse,
@@ -132,7 +122,6 @@ export async function signup(
         userId,
         activeRole: "customer",
         rememberMe: false,
-        mfaSatisfied: true,
         ip: ctx.ip,
         userAgent: ctx.userAgent,
       });
@@ -173,11 +162,10 @@ export async function signup(
   const principal = await requirePrincipal(result.issued.token);
 
   return {
-    outcome: "authenticated",
     token: result.issued.token,
     expiresAt: result.issued.idleExpiresAt.toISOString(),
     redirectTo: homeForRole("customer"),
-    session: toSessionResponse(principal, env.MFA_REQUIRED),
+    session: toSessionResponse(principal),
   };
 }
 
@@ -198,7 +186,6 @@ export async function login(
       status: users.status,
       failedLoginCount: users.failedLoginCount,
       lockedUntil: users.lockedUntil,
-      mfaEnrolledAt: users.mfaEnrolledAt,
     })
     .from(users)
     .where(whereEmail(input.email))
@@ -267,23 +254,12 @@ export async function login(
   await clearFailedAttempts(user.id);
 
   const staff = isStaffRole(activeRole);
-  const mfaEnrolled = user.mfaEnrolledAt !== null;
-  const mfaApplies = staff && env.MFA_REQUIRED;
-
-  const outcome = !mfaApplies
-    ? "authenticated"
-    : mfaEnrolled
-      ? "mfa_required"
-      : "mfa_enrolment_required";
 
   const issued = await db.transaction((tx) =>
     issueSession(tx, {
       userId: user.id,
       activeRole,
       rememberMe: input.rememberMe,
-      // Staff sessions start inert; the cookie is set but authorises nothing
-      // until TOTP is cleared.
-      mfaSatisfied: !mfaApplies,
       ip: ctx.ip,
       userAgent: ctx.userAgent,
     }),
@@ -295,7 +271,7 @@ export async function login(
     action: staff ? "auth.staff_login" : "auth.login",
     entityType: "users",
     entityId: user.id,
-    after: { activeRole, roles, outcome },
+    after: { activeRole, roles },
     ip: ctx.ip,
     requestId: ctx.requestId,
   });
@@ -303,16 +279,10 @@ export async function login(
   const principal = await requirePrincipal(issued.token);
 
   return {
-    outcome,
     token: issued.token,
     expiresAt: issued.idleExpiresAt.toISOString(),
-    redirectTo:
-      outcome === "authenticated"
-        ? homeForRole(activeRole)
-        : outcome === "mfa_required"
-          ? MFA_VERIFY_PATH
-          : MFA_SETUP_PATH,
-    session: toSessionResponse(principal, env.MFA_REQUIRED),
+    redirectTo: homeForRole(activeRole),
+    session: toSessionResponse(principal),
   };
 }
 
@@ -336,98 +306,6 @@ async function clearFailedAttempts(userId: string): Promise<void> {
     .update(users)
     .set({ failedLoginCount: 0, lockedUntil: null })
     .where(eq(users.id, userId));
-}
-
-// ---------------------------------------------------------------------------
-// Staff TOTP
-// ---------------------------------------------------------------------------
-
-/**
- * Generates and stores a secret, but does **not** mark the user enrolled — that
- * happens only once they prove they can produce a code. Refused when already
- * enrolled, so a half-authenticated session can't silently replace a working
- * second factor.
- */
-export async function beginMfaEnrolment(
-  principal: AuthenticatedPrincipal,
-): Promise<{ uri: string; secret: string }> {
-  if (!principal.isStaff) {
-    throw new AppError("forbidden", "Two-factor authentication is for staff accounts.");
-  }
-  if (principal.mfaEnrolled) {
-    throw new AppError(
-      "conflict",
-      "This account already has an authenticator app. Ask an admin to reset it.",
-    );
-  }
-
-  const secret = createTotpSecret();
-
-  await db
-    .update(users)
-    .set({ mfaSecret: encryptTotpSecret(secret) })
-    .where(and(eq(users.id, principal.userId), isNull(users.mfaEnrolledAt)));
-
-  return { uri: buildTotpUri(secret, principal.email), secret };
-}
-
-/** Confirms enrolment with a live code, then satisfies MFA for this session. */
-export async function completeMfaEnrolment(
-  principal: AuthenticatedPrincipal,
-  code: string,
-  ctx: RequestContext,
-): Promise<void> {
-  const [row] = await db
-    .select({ mfaSecret: users.mfaSecret, mfaEnrolledAt: users.mfaEnrolledAt })
-    .from(users)
-    .where(eq(users.id, principal.userId))
-    .limit(1);
-
-  if (!row?.mfaSecret || row.mfaEnrolledAt) {
-    throw new AppError("conflict", "Start the setup again — no pending enrolment found.");
-  }
-  if (!(await verifyTotpCode(row.mfaSecret, code))) {
-    throw new AppError("mfa_invalid", "That code didn't match. Try the next one.", {
-      fieldErrors: { code: "That code didn't match. Try the next one." },
-    });
-  }
-
-  await db.transaction(async (tx) => {
-    await tx
-      .update(users)
-      .set({ mfaEnrolledAt: new Date() })
-      .where(eq(users.id, principal.userId));
-    await recordAudit(tx, {
-      actorId: principal.userId,
-      actorRole: principal.activeRole,
-      action: "auth.mfa_enrolled",
-      entityType: "users",
-      entityId: principal.userId,
-      ip: ctx.ip,
-      requestId: ctx.requestId,
-    });
-  });
-
-  await markMfaSatisfied(principal.sessionId);
-}
-
-export async function verifyMfa(
-  principal: AuthenticatedPrincipal,
-  code: string,
-): Promise<void> {
-  const [row] = await db
-    .select({ mfaSecret: users.mfaSecret })
-    .from(users)
-    .where(and(eq(users.id, principal.userId), rawSql`${users.mfaEnrolledAt} is not null`))
-    .limit(1);
-
-  if (!(await verifyTotpCode(row?.mfaSecret ?? null, code))) {
-    throw new AppError("mfa_invalid", "That code didn't match. Try the next one.", {
-      fieldErrors: { code: "That code didn't match. Try the next one." },
-    });
-  }
-
-  await markMfaSatisfied(principal.sessionId);
 }
 
 // ---------------------------------------------------------------------------
@@ -623,17 +501,12 @@ export async function acceptInvite(
     return { userId: consumed.userId, activeRole: resolved };
   });
 
-  // Sign them straight in. Staff still face enrolment before the session does
-  // anything, exactly as on a normal login.
-  const staff = isStaffRole(activeRole);
-  const mfaApplies = staff && env.MFA_REQUIRED;
-
+  // Sign them straight in — accepting the invite is the credential check.
   const issued = await db.transaction((tx) =>
     issueSession(tx, {
       userId,
       activeRole,
       rememberMe: false,
-      mfaSatisfied: !mfaApplies,
       ip: ctx.ip,
       userAgent: ctx.userAgent,
     }),
@@ -642,11 +515,10 @@ export async function acceptInvite(
   const principal = await requirePrincipal(issued.token);
 
   return {
-    outcome: mfaApplies ? "mfa_enrolment_required" : "authenticated",
     token: issued.token,
     expiresAt: issued.idleExpiresAt.toISOString(),
-    redirectTo: mfaApplies ? MFA_SETUP_PATH : homeForRole(activeRole),
-    session: toSessionResponse(principal, env.MFA_REQUIRED),
+    redirectTo: homeForRole(activeRole),
+    session: toSessionResponse(principal),
   };
 }
 

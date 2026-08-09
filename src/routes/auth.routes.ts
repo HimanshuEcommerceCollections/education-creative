@@ -5,22 +5,16 @@ import {
   forgotPasswordRequestSchema,
   inviteTokenQuerySchema,
   loginRequestSchema,
-  mfaEnrolRequestSchema,
-  mfaVerifyRequestSchema,
   resendVerificationRequestSchema,
   resetPasswordRequestSchema,
   signupRequestSchema,
   verifyEmailRequestSchema,
 } from "../contracts/auth.ts";
-import { homeForRole } from "../contracts/roles.ts";
-import { env } from "../env.ts";
 import { AppError } from "../lib/app-error.ts";
 import { moderateLimit, strictLimit } from "../plugins/rate-limit.ts";
 import { requestContext } from "../plugins/request-context.ts";
 import {
   acceptInvite,
-  beginMfaEnrolment,
-  completeMfaEnrolment,
   login,
   logout,
   logoutEverywhere,
@@ -29,13 +23,12 @@ import {
   resetPassword,
   signup,
   verifyEmail,
-  verifyMfa,
 } from "../services/auth.service.ts";
 import { peekEmailToken } from "../services/email-token.service.ts";
 import { db } from "../db/client.ts";
 import { users } from "../db/schema/index.ts";
 import { eq } from "drizzle-orm";
-import { loadRoles, resolveSession, toSessionResponse } from "../services/session.service.ts";
+import { loadRoles, toSessionResponse } from "../services/session.service.ts";
 import { resolveActiveRole } from "../contracts/roles.ts";
 
 /**
@@ -69,7 +62,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
   // Session introspection — the only thing the BFF trusts
   // -------------------------------------------------------------------------
   app.get("/session", { preHandler: [app.authenticate] }, async (request) => {
-    return toSessionResponse(request.principal!, env.MFA_REQUIRED);
+    return toSessionResponse(request.principal!);
   });
 
   app.post("/logout", { preHandler: [app.authenticate] }, async (request) => {
@@ -81,46 +74,6 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     await logoutEverywhere(request.principal!.userId);
     return { message: "Signed out on every device." };
   });
-
-  // -------------------------------------------------------------------------
-  // Staff TOTP. These use `authenticate`, not `requireFullAuth` — by definition
-  // they run on a session that has not yet satisfied MFA.
-  // -------------------------------------------------------------------------
-  app.get("/mfa/setup", { preHandler: [app.authenticate] }, async (request) => {
-    return beginMfaEnrolment(request.principal!);
-  });
-
-  app.post(
-    "/mfa/enrol",
-    { preHandler: [strictLimit(), app.authenticate] },
-    async (request) => {
-      const { code } = mfaEnrolRequestSchema.parse(request.body);
-      const principal = request.principal!;
-      await completeMfaEnrolment(principal, code, requestContext(request));
-
-      const refreshed = await resolveSessionOrThrow(request.headers.authorization);
-      return {
-        redirectTo: homeForRole(principal.activeRole),
-        session: toSessionResponse(refreshed, env.MFA_REQUIRED),
-      };
-    },
-  );
-
-  app.post(
-    "/mfa/verify",
-    { preHandler: [strictLimit(), app.authenticate] },
-    async (request) => {
-      const { code } = mfaVerifyRequestSchema.parse(request.body);
-      const principal = request.principal!;
-      await verifyMfa(principal, code);
-
-      const refreshed = await resolveSessionOrThrow(request.headers.authorization);
-      return {
-        redirectTo: homeForRole(principal.activeRole),
-        session: toSessionResponse(refreshed, env.MFA_REQUIRED),
-      };
-    },
-  );
 
   // -------------------------------------------------------------------------
   // Email verification
@@ -218,20 +171,4 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(201).send(result);
     },
   );
-}
-
-/**
- * Re-resolves the caller's own session after a state change so the response
- * reflects the new MFA flags rather than the pre-change snapshot the preHandler
- * attached.
- */
-async function resolveSessionOrThrow(authorization: string | undefined) {
-  const token = authorization?.startsWith("Bearer ")
-    ? authorization.slice("Bearer ".length).trim()
-    : null;
-  const principal = token ? await resolveSession(token) : null;
-  if (!principal) {
-    throw new AppError("unauthenticated", "Your session has expired. Sign in again.");
-  }
-  return principal;
 }

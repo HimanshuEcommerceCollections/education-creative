@@ -125,25 +125,14 @@ check(
 console.log("\n— production guards —");
 check(
   "console driver rejected in production",
-  { NODE_ENV: "production", EMAIL_DRIVER: "console", MFA_REQUIRED: "true" },
+  { NODE_ENV: "production", EMAIL_DRIVER: "console" },
   "EMAIL_DRIVER",
-);
-check(
-  "MFA cannot be disabled in production",
-  {
-    NODE_ENV: "production",
-    EMAIL_DRIVER: "resend",
-    RESEND_API_KEY: "re_x",
-    MFA_REQUIRED: "false",
-  },
-  "MFA_REQUIRED",
 );
 /** Everything production demands, so the "accepted" case stays meaningful. */
 const PRODUCTION = {
   NODE_ENV: "production",
   EMAIL_DRIVER: "resend",
   RESEND_API_KEY: "re_x",
-  MFA_REQUIRED: "true",
 };
 
 check("a valid production config is accepted", PRODUCTION, "ok");
@@ -157,18 +146,24 @@ check(
 console.log("\n— guards can't be bypassed by a mis-set NODE_ENV —");
 /*
  * This is what the first Vercel deployment actually did: NODE_ENV was not
- * "production" on a production deployment, so MFA, the mail driver, and the
- * outbox all silently stopped being checked.
+ * "production" on a production deployment, so the mail driver and the outbox
+ * both silently stopped being checked.
  */
 check(
-  "a production Vercel deployment still requires staff MFA",
-  { NODE_ENV: "development", VERCEL_ENV: "production", EMAIL_DRIVER: "resend", RESEND_API_KEY: "re_x", MFA_REQUIRED: "false" },
-  "MFA_REQUIRED",
+  "a production Vercel deployment still refuses the console driver",
+  { NODE_ENV: "development", VERCEL_ENV: "production", EMAIL_DRIVER: "console" },
+  "EMAIL_DRIVER",
 );
 check(
-  "a production Vercel deployment still refuses the console driver",
-  { NODE_ENV: "development", VERCEL_ENV: "production", EMAIL_DRIVER: "console", MFA_REQUIRED: "true" },
-  "EMAIL_DRIVER",
+  "a production Vercel deployment still refuses an outbox file",
+  {
+    NODE_ENV: "development",
+    VERCEL_ENV: "production",
+    EMAIL_DRIVER: "resend",
+    RESEND_API_KEY: "re_x",
+    EMAIL_OUTBOX_FILE: "/tmp/outbox.jsonl",
+  },
+  "EMAIL_OUTBOX_FILE",
 );
 check(
   "a Vercel preview deployment is not held to production rules",
