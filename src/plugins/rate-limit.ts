@@ -74,7 +74,7 @@ export function rateLimit(options: RateLimitOptions) {
   };
 }
 
-/** Credential endpoints — login, signup, reset, MFA. Per-route, deliberately tight. */
+/** Credential endpoints — login, signup, reset. Per-route, deliberately tight. */
 export const strictLimit = () => rateLimit({ max: 10, windowSeconds: 10 * 60 });
 
 /** Endpoints a legitimate user might retry a few times. */

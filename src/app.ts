@@ -62,10 +62,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(educatorApplicationRoutes, { prefix: "/educator-applications" });
 
   if (!isProduction) {
-    app.log.info(
-      { mfaRequired: env.MFA_REQUIRED, webOrigin: env.WEB_ORIGIN },
-      "development configuration",
-    );
+    app.log.info({ webOrigin: env.WEB_ORIGIN }, "development configuration");
   }
 
   return app;

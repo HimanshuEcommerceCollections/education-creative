@@ -53,11 +53,6 @@ export const envSchema = z
     SESSION_PEPPER: z.string().min(32),
     FIELD_ENCRYPTION_KEY: base64Key32,
 
-    MFA_REQUIRED: z
-      .enum(["true", "false"])
-      .default("true")
-      .transform((value) => value === "true"),
-
     /**
      * Which `EmailService` driver to construct. Business logic never names a
      * provider, so switching is a config change only.
@@ -112,7 +107,7 @@ export const envSchema = z
     SEED_ADMIN_NAME: optionalString(),
   })
   // Fail-closed on the combinations that would otherwise blow up at the moment
-  // an email is first sent, or silently leave staff unprotected in production.
+  // an email is first sent, or quietly ship a development-only setting.
   .superRefine((env, ctx) => {
     const required = (key: keyof typeof env, message: string) => {
       if (!env[key]) ctx.addIssue({ code: "custom", path: [key], message });
@@ -166,24 +161,16 @@ export const envSchema = z
     /**
      * A real deployment, whatever NODE_ENV happens to say.
      *
-     * The guards below are the ones that keep staff MFA on, keep a driver that
-     * sends no mail out of production, and keep live tokens off disk. Keying them
-     * on NODE_ENV alone made all of them switchable by one mis-set variable —
-     * which is exactly what happened on
-     * the first Vercel deployment, where NODE_ENV was not "production" and every
-     * one of these silently stopped applying.
+     * The guards below are the ones that keep a driver that sends no mail out of
+     * production, and keep live tokens off disk. Keying them on NODE_ENV alone
+     * made all of them switchable by one mis-set variable — which is exactly what
+     * happened on the first Vercel deployment, where NODE_ENV was not
+     * "production" and every one of these silently stopped applying.
      */
     const isProductionLike =
       env.NODE_ENV === "production" || env.VERCEL_ENV === "production";
 
     if (isProductionLike) {
-      if (!env.MFA_REQUIRED) {
-        ctx.addIssue({
-          code: "custom",
-          path: ["MFA_REQUIRED"],
-          message: "must be true in production — staff TOTP is mandatory",
-        });
-      }
       if (env.EMAIL_DRIVER === "console") {
         ctx.addIssue({
           code: "custom",

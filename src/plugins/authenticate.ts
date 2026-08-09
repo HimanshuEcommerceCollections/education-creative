@@ -2,11 +2,9 @@ import type { FastifyReply, FastifyRequest } from "fastify";
 import fp from "fastify-plugin";
 
 import { type UserRole, isStaffRole } from "../contracts/roles.ts";
-import { env } from "../env.ts";
 import { AppError } from "../lib/app-error.ts";
 import {
   type AuthenticatedPrincipal,
-  isFullyAuthenticated,
   resolveSession,
   touchSession,
 } from "../services/session.service.ts";
@@ -51,38 +49,15 @@ async function authenticate(request: FastifyRequest, _reply: FastifyReply): Prom
 }
 
 /**
- * Full authentication: a valid session **and** every precondition for acting as
- * its role. For staff that means TOTP enrolled and satisfied — a staff session
- * that hasn't cleared its second factor authorises nothing, which is what makes
- * a single shared login page safe.
- */
-async function requireFullAuth(
-  request: FastifyRequest,
-  reply: FastifyReply,
-): Promise<void> {
-  await authenticate(request, reply);
-  const principal = request.principal!;
-
-  if (!isFullyAuthenticated(principal, env.MFA_REQUIRED)) {
-    throw new AppError(
-      "mfa_required",
-      principal.mfaEnrolled
-        ? "Enter the code from your authenticator app to continue."
-        : "Set up two-factor authentication to continue.",
-    );
-  }
-}
-
-/**
- * Capability gate. Fails closed: an unknown role, a roleless principal, or a
- * staff session short of MFA never reaches the handler.
+ * Capability gate. Fails closed: an unknown role or a roleless principal never
+ * reaches the handler.
  */
 function requireRole(...allowed: UserRole[]) {
   return async function roleGuard(
     request: FastifyRequest,
     reply: FastifyReply,
   ): Promise<void> {
-    await requireFullAuth(request, reply);
+    await authenticate(request, reply);
     const principal = request.principal!;
 
     // Checked against `activeRole` rather than the full role set: a multi-role
@@ -98,7 +73,7 @@ const requireStaff = async function staffGuard(
   request: FastifyRequest,
   reply: FastifyReply,
 ): Promise<void> {
-  await requireFullAuth(request, reply);
+  await authenticate(request, reply);
   if (!isStaffRole(request.principal!.activeRole)) {
     throw new AppError("forbidden", "You don't have access to that.");
   }
@@ -107,7 +82,6 @@ const requireStaff = async function staffGuard(
 export const authPlugin = fp(
   async (app) => {
     app.decorate("authenticate", authenticate);
-    app.decorate("requireFullAuth", requireFullAuth);
     app.decorate("requireRole", requireRole);
     app.decorate("requireStaff", requireStaff);
   },
@@ -116,9 +90,8 @@ export const authPlugin = fp(
 
 declare module "fastify" {
   interface FastifyInstance {
-    /** Valid session only — used by the MFA endpoints, which run pre-MFA. */
+    /** Valid session only, with no role check. */
     authenticate: typeof authenticate;
-    requireFullAuth: typeof requireFullAuth;
     requireRole: typeof requireRole;
     requireStaff: typeof requireStaff;
   }

@@ -28,7 +28,6 @@ export interface IssuedSession {
   sessionId: string;
   idleExpiresAt: Date;
   absoluteExpiresAt: Date;
-  mfaSatisfiedAt: Date | null;
 }
 
 /**
@@ -37,10 +36,6 @@ export interface IssuedSession {
  * `rememberMe` is honoured only where the role's policy allows it, so a staff
  * account ticking "Remember me" on the shared login page silently gets the short
  * staff window rather than a 30-day one.
- *
- * `mfaSatisfied` starts false for staff: the session exists but is inert until
- * `POST /auth/mfa/verify` stamps it. Non-staff sessions are satisfied on
- * creation because no second factor applies to them.
  */
 export async function issueSession(
   tx: DbOrTx,
@@ -48,7 +43,6 @@ export async function issueSession(
     userId: string;
     activeRole: UserRole;
     rememberMe: boolean;
-    mfaSatisfied: boolean;
     ip?: string | null;
     userAgent?: string | null;
   },
@@ -62,7 +56,6 @@ export async function issueSession(
   const absoluteExpiresAt = daysFromNow(
     useRememberMe ? policy.rememberMeAbsoluteDays : policy.absoluteDays,
   );
-  const mfaSatisfiedAt = input.mfaSatisfied ? new Date() : null;
 
   const token = generateToken();
 
@@ -73,7 +66,6 @@ export async function issueSession(
       userId: input.userId,
       activeRole: input.activeRole,
       isStaff: isStaffRole(input.activeRole),
-      mfaSatisfiedAt,
       idleExpiresAt,
       absoluteExpiresAt,
       ip: input.ip ?? null,
@@ -86,7 +78,6 @@ export async function issueSession(
     sessionId: row!.id,
     idleExpiresAt,
     absoluteExpiresAt,
-    mfaSatisfiedAt,
   };
 }
 
@@ -99,8 +90,6 @@ export interface AuthenticatedPrincipal {
   roles: UserRole[];
   activeRole: UserRole;
   isStaff: boolean;
-  mfaSatisfied: boolean;
-  mfaEnrolled: boolean;
   idleExpiresAt: Date;
   absoluteExpiresAt: Date;
 }
@@ -124,7 +113,6 @@ export async function resolveSession(
       userId: sessions.userId,
       activeRole: sessions.activeRole,
       isStaff: sessions.isStaff,
-      mfaSatisfiedAt: sessions.mfaSatisfiedAt,
       idleExpiresAt: sessions.idleExpiresAt,
       absoluteExpiresAt: sessions.absoluteExpiresAt,
       email: users.email,
@@ -132,7 +120,6 @@ export async function resolveSession(
       emailVerifiedAt: users.emailVerifiedAt,
       userStatus: users.status,
       userDeletedAt: users.deletedAt,
-      mfaEnrolledAt: users.mfaEnrolledAt,
     })
     .from(sessions)
     .innerJoin(users, eq(users.id, sessions.userId))
@@ -163,8 +150,6 @@ export async function resolveSession(
     roles,
     activeRole: row.activeRole,
     isStaff: row.isStaff,
-    mfaSatisfied: row.mfaSatisfiedAt !== null,
-    mfaEnrolled: row.mfaEnrolledAt !== null,
     idleExpiresAt: row.idleExpiresAt,
     absoluteExpiresAt: row.absoluteExpiresAt,
   };
@@ -189,14 +174,6 @@ export async function touchSession(principal: AuthenticatedPrincipal): Promise<v
     .update(sessions)
     .set({ idleExpiresAt: clamped, lastSeenAt: new Date() })
     .where(eq(sessions.id, principal.sessionId));
-}
-
-/** Stamps the staff second factor as satisfied for this session only. */
-export async function markMfaSatisfied(sessionId: string): Promise<void> {
-  await db
-    .update(sessions)
-    .set({ mfaSatisfiedAt: new Date() })
-    .where(eq(sessions.id, sessionId));
 }
 
 export async function revokeSession(sessionId: string): Promise<void> {
@@ -232,23 +209,7 @@ export async function loadRoles(tx: DbOrTx, userId: string): Promise<UserRole[]>
   return rows.map((row) => row.role);
 }
 
-/**
- * A staff principal that hasn't cleared TOTP, or one that must still enrol, is
- * authenticated but not yet authorised for anything.
- */
-export function isFullyAuthenticated(
-  principal: AuthenticatedPrincipal,
-  mfaRequired: boolean,
-): boolean {
-  if (!principal.isStaff) return true;
-  if (!mfaRequired) return true;
-  return principal.mfaEnrolled && principal.mfaSatisfied;
-}
-
-export function toSessionResponse(
-  principal: AuthenticatedPrincipal,
-  mfaRequired: boolean,
-): SessionResponse {
+export function toSessionResponse(principal: AuthenticatedPrincipal): SessionResponse {
   return {
     user: {
       id: principal.userId,
@@ -259,9 +220,6 @@ export function toSessionResponse(
     roles: principal.roles,
     activeRole: principal.activeRole,
     isStaff: principal.isStaff,
-    mfaSatisfied: principal.mfaSatisfied,
-    mfaEnrolled: principal.mfaEnrolled,
-    fullyAuthenticated: isFullyAuthenticated(principal, mfaRequired),
     idleExpiresAt: principal.idleExpiresAt.toISOString(),
     absoluteExpiresAt: principal.absoluteExpiresAt.toISOString(),
   };

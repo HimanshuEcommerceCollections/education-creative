@@ -13,7 +13,7 @@ export type UserRole = z.infer<typeof userRoleSchema>;
  */
 export const ROLE_PRECEDENCE = ["admin", "coordinator", "educator", "customer"] as const;
 
-/** Roles subject to the short idle window, no remember-me, and mandatory TOTP. */
+/** Roles subject to the short idle window and no remember-me. */
 export const STAFF_ROLES = ["admin", "coordinator"] as const;
 
 export function isStaffRole(role: UserRole): boolean {

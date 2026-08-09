@@ -184,7 +184,7 @@ const login = await call("/auth/login", {
   body: { email: parentEmail, password: PASSWORD, rememberMe: true },
 });
 const parentToken: string = login.body?.token;
-ok("login succeeds", login.status === 200 && login.body?.outcome === "authenticated");
+ok("login succeeds", login.status === 200 && typeof login.body?.token === "string");
 ok("customer lands on the homepage", login.body?.redirectTo === "/");
 ok(
   "remember-me extends the idle window past a week",
@@ -206,7 +206,7 @@ ok(
 
 const session = await call("/auth/session", { token: parentToken });
 ok("session introspection works", session.status === 200);
-ok("session reports fullyAuthenticated for a customer", session.body?.fullyAuthenticated === true);
+ok("session resolves the customer role", session.body?.activeRole === "customer");
 
 const noToken = await call("/auth/session");
 ok("session without a token is 401", noToken.status === 401);

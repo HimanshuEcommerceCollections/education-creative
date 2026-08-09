@@ -33,11 +33,6 @@ export const fullNameSchema = z
   .min(2, "Enter your name.")
   .max(120, "That name is too long.");
 
-export const totpCodeSchema = z
-  .string()
-  .trim()
-  .regex(/^\d{6}$/, "Enter the 6-digit code from your authenticator app.");
-
 // ---------------------------------------------------------------------------
 // Signup — customers only. Educators apply; staff are invited.
 // ---------------------------------------------------------------------------
@@ -80,28 +75,7 @@ export const loginRequestSchema = z
 
 export type LoginRequest = z.infer<typeof loginRequestSchema>;
 
-/**
- * What login resolved to. A staff account always lands on `mfa_enrolment` or
- * `mfa_required` first; the session cookie is set in every case but is inert
- * until MFA is satisfied.
- */
-export const loginOutcomeSchema = z.enum([
-  "authenticated",
-  "mfa_required",
-  "mfa_enrolment_required",
-]);
-
-export type LoginOutcome = z.infer<typeof loginOutcomeSchema>;
-
-/**
- * Where a staff login goes before it can do anything. Shared with the client so
- * the routes and the server's `redirectTo` can't disagree.
- */
-export const MFA_VERIFY_PATH = "/login/mfa";
-export const MFA_SETUP_PATH = "/login/mfa/setup";
-
 export const loginResponseSchema = z.object({
-  outcome: loginOutcomeSchema,
   /** Opaque session token — the BFF stores this in an HttpOnly cookie. */
   token: z.string(),
   expiresAt: z.iso.datetime(),
@@ -126,31 +100,11 @@ export const sessionResponseSchema = z.object({
   roles: z.array(userRoleSchema),
   activeRole: userRoleSchema,
   isStaff: z.boolean(),
-  /** False on a staff session that has not cleared TOTP yet. */
-  mfaSatisfied: z.boolean(),
-  mfaEnrolled: z.boolean(),
-  /** True once every precondition for acting as `activeRole` is met. */
-  fullyAuthenticated: z.boolean(),
   idleExpiresAt: z.iso.datetime(),
   absoluteExpiresAt: z.iso.datetime(),
 });
 
 export type SessionResponse = z.infer<typeof sessionResponseSchema>;
-
-// ---------------------------------------------------------------------------
-// Staff TOTP
-// ---------------------------------------------------------------------------
-
-export const mfaSetupResponseSchema = z.object({
-  /** `otpauth://` URI for the authenticator app / QR code. */
-  uri: z.string(),
-  /** Shown for manual entry when a camera isn't available. */
-  secret: z.string(),
-});
-
-export const mfaVerifyRequestSchema = z.object({ code: totpCodeSchema }).strict();
-
-export const mfaEnrolRequestSchema = z.object({ code: totpCodeSchema }).strict();
 
 // ---------------------------------------------------------------------------
 // Email verification, password reset, invite acceptance
@@ -190,8 +144,6 @@ export type AcceptInviteRequest = z.infer<typeof acceptInviteRequestSchema>;
 export type VerifyEmailRequest = z.infer<typeof verifyEmailRequestSchema>;
 export type ForgotPasswordRequest = z.infer<typeof forgotPasswordRequestSchema>;
 export type ResetPasswordRequest = z.infer<typeof resetPasswordRequestSchema>;
-export type MfaVerifyRequest = z.infer<typeof mfaVerifyRequestSchema>;
-export type MfaSetupResponse = z.infer<typeof mfaSetupResponseSchema>;
 
 /** Read before showing the set-password form, so it can greet them by name. */
 export const inviteDetailsResponseSchema = z.object({

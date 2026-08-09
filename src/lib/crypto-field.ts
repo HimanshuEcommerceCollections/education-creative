@@ -4,8 +4,7 @@ import { env } from "../env.ts";
 
 /**
  * AES-256-GCM application-level encryption for the few columns that hold a
- * minor's PII — learner first names and in-home addresses (§9). Used by the TOTP
- * secret too, so a database dump doesn't hand over staff second factors.
+ * minor's PII — learner first names and in-home addresses (§9).
  *
  * Launch scope is a single key held in the secrets broker; per-record envelope
  * encryption is the documented hardening follow-up. The version prefix is what

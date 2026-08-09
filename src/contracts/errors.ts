@@ -9,9 +9,6 @@ export const ERROR_CODES = [
   "invalid_credentials",
   "account_locked",
   "account_inactive",
-  /** Password accepted, but the staff second factor is still outstanding. */
-  "mfa_required",
-  "mfa_invalid",
   "email_in_use",
   "email_not_verified",
   "invalid_token",
@@ -47,8 +44,6 @@ const STATUS_BY_CODE: Record<ErrorCode, number> = {
   invalid_credentials: 401,
   account_locked: 423,
   account_inactive: 403,
-  mfa_required: 401,
-  mfa_invalid: 401,
   email_in_use: 409,
   email_not_verified: 403,
   invalid_token: 400,

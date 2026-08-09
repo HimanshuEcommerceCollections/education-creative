@@ -86,12 +86,6 @@ async function main(): Promise<void> {
   });
 
   logger.info({ email: normalisedEmail }, "admin created");
-
-  if (env.MFA_REQUIRED) {
-    logger.warn(
-      "MFA_REQUIRED is on — this admin must enrol an authenticator app on first sign-in.",
-    );
-  }
 }
 
 try {

@@ -48,9 +48,6 @@ export const users = pgTable(
     emailVerifiedAt: timestamp({ withTimezone: true }),
     /** Set when the account holder attests to being an adult (signup / invite accept). */
     ageGateAttestedAt: timestamp({ withTimezone: true }),
-    /** Base32 TOTP secret, encrypted at rest. Staff only. */
-    mfaSecret: text(),
-    mfaEnrolledAt: timestamp({ withTimezone: true }),
     /** Consecutive failed password attempts; reset on success. Drives lockout. */
     failedLoginCount: integer().notNull().default(0),
     lockedUntil: timestamp({ withTimezone: true }),
@@ -130,12 +127,6 @@ export const sessions = pgTable(
       .references(() => users.id, { onDelete: "cascade" }),
     activeRole: userRoleEnum().notNull(),
     isStaff: boolean().notNull().default(false),
-    /**
-     * Null until the TOTP second factor passes. A staff session with this null
-     * is authenticated but not yet authorised for anything — see the
-     * `mfa_satisfied` precondition in §5.
-     */
-    mfaSatisfiedAt: timestamp({ withTimezone: true }),
     /** Rolling: extended on each authenticated request. */
     idleExpiresAt: timestamp({ withTimezone: true }).notNull(),
     /** Hard ceiling: never extended, so a session cannot live forever. */
