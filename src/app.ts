@@ -7,8 +7,11 @@ import { logger } from "./lib/logger.ts";
 import { authPlugin } from "./plugins/authenticate.ts";
 import { registerErrorHandler } from "./plugins/error-handler.ts";
 import { authRoutes } from "./routes/auth.routes.ts";
+import { bookingRoutes } from "./routes/booking.routes.ts";
 import { educatorApplicationRoutes } from "./routes/educator-application.routes.ts";
+import { pricingRoutes } from "./routes/pricing.routes.ts";
 import { staffRoutes } from "./routes/staff.routes.ts";
+import { stripeWebhookRoutes } from "./routes/stripe-webhook.routes.ts";
 
 export async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify({
@@ -62,6 +65,19 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(authRoutes, { prefix: "/auth" });
   await app.register(educatorApplicationRoutes, { prefix: "/educator-applications" });
   await app.register(staffRoutes, { prefix: "/staff" });
+  await app.register(pricingRoutes, { prefix: "/pricing" });
+  await app.register(bookingRoutes, { prefix: "/bookings" });
+
+  /**
+   * Registered last and in its own encapsulated scope, because it replaces the
+   * `application/json` parser with a raw-body one. Fastify scopes a content-type
+   * parser to the plugin instance that adds it, so keeping this in a separate
+   * `register` is what stops every other route from suddenly receiving a Buffer.
+   *
+   * Stripe calls this directly — not through the Next app. The URL to register in
+   * the Stripe dashboard is `<this service's public origin>/stripe/webhook`.
+   */
+  await app.register(stripeWebhookRoutes, { prefix: "/stripe" });
 
   if (!isProduction) {
     app.log.info({ webOrigin: env.WEB_ORIGIN }, "development configuration");

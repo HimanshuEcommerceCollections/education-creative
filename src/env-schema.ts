@@ -102,6 +102,56 @@ export const envSchema = z
     AWS_SECRET_ACCESS_KEY: optionalString(),
     SES_CONFIGURATION_SET: optionalString(),
 
+    // --- stripe -----------------------------------------------------------
+    /**
+     * Secret key. `sk_` for a full key, `rk_` for a restricted one — prefer a
+     * restricted key scoped to Checkout Sessions, PaymentIntents, Refunds and
+     * Events write/read, since nothing here needs the rest of the account.
+     */
+    STRIPE_SECRET_KEY: optionalText(
+      z.string().regex(/^(sk|rk)_(test|live)_/, "must start with sk_ or rk_"),
+    ),
+    /** Signing secret for the endpoint registered in the Stripe dashboard. */
+    STRIPE_WEBHOOK_SECRET: optionalText(
+      z.string().startsWith("whsec_", "must start with whsec_"),
+    ),
+    /**
+     * Publishable key. Held here so the API can hand it to the browser alongside
+     * a Checkout Session's client secret — one source of truth for which Stripe
+     * account is in play, rather than a second copy the two halves can disagree on.
+     */
+    STRIPE_PUBLISHABLE_KEY: optionalText(
+      z.string().regex(/^pk_(test|live)_/, "must start with pk_test_ or pk_live_"),
+    ),
+    /**
+     * **Which project owns an object in a shared Stripe account.**
+     *
+     * This is not a label — it is a safety mechanism. A Stripe account delivers
+     * every event of a subscribed type to *every* registered webhook endpoint,
+     * regardless of which integration created the object. So if this project and
+     * another share an account, this project's endpoint receives the other's
+     * `payment_intent.succeeded` too.
+     *
+     * That is actively dangerous here: the rule for "a succeeded PaymentIntent
+     * with no matching local booking" is to refund it (§8). Unfiltered, this
+     * service would refund another project's revenue, correctly and immediately.
+     *
+     * So every object we create carries `metadata.project = STRIPE_PROJECT_KEY`,
+     * and the webhook drops anything that doesn't match before any handler sees
+     * it. Two projects must never share a value.
+     *
+     * A separate Stripe account (or at least a separate sandbox) per project is
+     * still the better answer — see the note in `lib/stripe.ts`.
+     */
+    STRIPE_PROJECT_KEY: optionalText(
+      z
+        .string()
+        .regex(
+          /^[a-z0-9][a-z0-9_-]{1,31}$/,
+          "lowercase letters, digits, dash and underscore; 2-32 characters",
+        ),
+    ),
+
     SEED_ADMIN_EMAIL: optionalText(z.email()),
     SEED_ADMIN_PASSWORD: optionalString(),
     SEED_ADMIN_NAME: optionalString(),
@@ -159,16 +209,66 @@ export const envSchema = z
     }
 
     /**
+     * Stripe is all-or-nothing. A half-configured integration is the worst of the
+     * three states: the booking flow offers a pay button, the Checkout Session is
+     * created, the parent is charged — and with no signing secret the webhook that
+     * is the *only* source of payment truth can never be verified, so the booking
+     * sits unpaid forever while the money is real.
+     */
+    const stripeKeys = [
+      "STRIPE_SECRET_KEY",
+      "STRIPE_WEBHOOK_SECRET",
+      "STRIPE_PUBLISHABLE_KEY",
+      "STRIPE_PROJECT_KEY",
+    ] as const;
+
+    if (stripeKeys.some((key) => env[key])) {
+      for (const key of stripeKeys) {
+        required(
+          key,
+          "required once any STRIPE_* variable is set — a partially configured payment path can charge a card it cannot then confirm",
+        );
+      }
+
+      /*
+       * Mode agreement. Mixing a live secret with a test publishable key produces
+       * a Checkout Session the browser cannot mount, and the reverse silently
+       * takes real money in what someone believes is a test.
+       */
+      const secretMode = env.STRIPE_SECRET_KEY?.includes("_live_") ? "live" : "test";
+      const publishableMode = env.STRIPE_PUBLISHABLE_KEY?.includes("_live_")
+        ? "live"
+        : "test";
+
+      if (env.STRIPE_SECRET_KEY && env.STRIPE_PUBLISHABLE_KEY && secretMode !== publishableMode) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["STRIPE_PUBLISHABLE_KEY"],
+          message: `is a ${publishableMode} key but STRIPE_SECRET_KEY is ${secretMode} — both must be the same mode`,
+        });
+      }
+    }
+
+    /**
      * A real deployment, whatever NODE_ENV happens to say.
      *
      * The guards below are the ones that keep a driver that sends no mail out of
-     * production, and keep live tokens off disk. Keying them on NODE_ENV alone
-     * made all of them switchable by one mis-set variable — which is exactly what
-     * happened on the first Vercel deployment, where NODE_ENV was not
-     * "production" and every one of these silently stopped applying.
+     * production, keep live tokens off disk, and keep a test Stripe key out of a
+     * live checkout. Keying them on NODE_ENV alone made all of them switchable by
+     * one mis-set variable — which is exactly what happened on the first Vercel
+     * deployment, where NODE_ENV was not "production" and every one of these
+     * silently stopped applying.
      */
     const isProductionLike =
       env.NODE_ENV === "production" || env.VERCEL_ENV === "production";
+
+    if (isProductionLike && env.STRIPE_SECRET_KEY?.includes("_test_")) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["STRIPE_SECRET_KEY"],
+        message: "is a test key — production would take no real payments",
+      });
+    }
 
     if (isProductionLike) {
       if (env.EMAIL_DRIVER === "console") {

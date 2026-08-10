@@ -58,3 +58,67 @@ export const educatorVerificationStatusEnum = pgEnum("educator_verification_stat
   "approved",
   "suspended",
 ]);
+
+/** Where a session happens. Mirrors the contract's `BOOKING_FORMATS`. */
+export const bookingFormatEnum = pgEnum("booking_format", ["in_home", "online"]);
+
+/**
+ * The booking state machine (ARCHITECTURE.md §8).
+ *
+ * `paid_unconfirmed` is the state the locked flow revolves around: money is
+ * captured and nobody has committed to delivering the session yet. Only a
+ * coordinator moves it to `confirmed`, and only after every assigned educator is
+ * background-approved.
+ */
+export const bookingStatusEnum = pgEnum("booking_status", [
+  "pending_payment",
+  "paid_unconfirmed",
+  "confirmed",
+  "completed",
+  "no_show",
+  "refunded",
+  "partially_refunded",
+  "disputed",
+  "expired",
+]);
+
+/** Payment state, tracking Stripe's own vocabulary. */
+export const paymentStatusEnum = pgEnum("payment_status", [
+  "requires_payment",
+  "processing",
+  "succeeded",
+  "refunded",
+  "partially_refunded",
+  "failed",
+  "canceled",
+  "disputed",
+]);
+
+/** Learner age bands. Mirrors the contract's `LEARNER_AGE_BANDS`. */
+export const learnerAgeBandEnum = pgEnum("learner_age_band", [
+  "4-6",
+  "7-9",
+  "10-12",
+  "13-15",
+  "16-18",
+]);
+
+/** Append-only ledger accounts. */
+export const ledgerAccountEnum = pgEnum("ledger_account", [
+  "platform_revenue",
+  "educator_earnings_accrued",
+  "stripe_fee",
+  "refund",
+  "dispute",
+]);
+
+/**
+ * `accrued` becomes `at_risk` on a dispute and `reversed` on a loss. Educator
+ * earnings are held rather than paid out until the settlement window passes,
+ * because a chargeback can land months after the session.
+ */
+export const ledgerStatusEnum = pgEnum("ledger_status", [
+  "accrued",
+  "at_risk",
+  "reversed",
+]);
