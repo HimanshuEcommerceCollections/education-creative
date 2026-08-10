@@ -91,7 +91,20 @@ export const educatorProfiles = pgTable(
     backgroundCheckAt: timestamp({ withTimezone: true }),
     ratingCached: integer(),
     reviewCountCached: integer().notNull().default(0),
+    /**
+     * Published hourly rate, in cents. The pricing engine reads this until
+     * Phase 2's effective-dated `educator_rates` (per educator *and* subject)
+     * lands; the quote records the rate it actually used, so bookings priced
+     * against this column stay explainable after the move.
+     */
     minRateCents: integer(),
+    /**
+     * What this educator teaches. The booking flow offers these and the API
+     * rejects a subject that isn't in the list — otherwise a hand-crafted request
+     * could book "Astrophysics" with an arts teacher and only a coordinator
+     * reading the queue would notice.
+     */
+    subjects: text().array().notNull().default([]),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
     deletedAt: timestamp({ withTimezone: true }),

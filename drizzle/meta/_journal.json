@@ -15,6 +15,13 @@
       "when": 1786312158757,
       "tag": "0001_eager_jetstream",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1786396058875,
+      "tag": "0002_bright_sumo",
+      "breakpoints": true
     }
   ]
 }

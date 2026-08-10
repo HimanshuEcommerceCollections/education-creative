@@ -10,5 +10,7 @@ export * from "./roles.ts";
 export * from "./errors.ts";
 export * from "./consent.ts";
 export * from "./auth.ts";
+export * from "./bookings.ts";
 export * from "./educator-applications.ts";
 export * from "./staff-invites.ts";
+export * from "./pricing.ts";
