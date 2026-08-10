@@ -8,6 +8,7 @@ import { authPlugin } from "./plugins/authenticate.ts";
 import { registerErrorHandler } from "./plugins/error-handler.ts";
 import { authRoutes } from "./routes/auth.routes.ts";
 import { educatorApplicationRoutes } from "./routes/educator-application.routes.ts";
+import { staffRoutes } from "./routes/staff.routes.ts";
 
 export async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify({
@@ -60,6 +61,7 @@ export async function buildApp(): Promise<FastifyInstance> {
 
   await app.register(authRoutes, { prefix: "/auth" });
   await app.register(educatorApplicationRoutes, { prefix: "/educator-applications" });
+  await app.register(staffRoutes, { prefix: "/staff" });
 
   if (!isProduction) {
     app.log.info({ webOrigin: env.WEB_ORIGIN }, "development configuration");
