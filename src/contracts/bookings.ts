@@ -340,3 +340,261 @@ export const bookingStatusResponseSchema = z.object({
 });
 
 export type BookingStatusResponse = z.infer<typeof bookingStatusResponseSchema>;
+
+// ---------------------------------------------------------------------------
+// The confirm-later half of the flow
+// ---------------------------------------------------------------------------
+
+/**
+ * Every state a booking can be in, as one reusable schema. The literal list in
+ * `bookingStatusResponseSchema` predates this and is left alone deliberately —
+ * that response is a narrow contract with a polling client.
+ */
+export const BOOKING_STATUSES = [
+  "pending_payment",
+  "paid_unconfirmed",
+  "confirmed",
+  "completed",
+  "no_show",
+  "refunded",
+  "partially_refunded",
+  "disputed",
+  "expired",
+] as const;
+
+export const bookingStatusSchema = z.enum(BOOKING_STATUSES);
+export type BookingStatus = (typeof BOOKING_STATUSES)[number];
+
+/** An educator as named on a booking. Slug + display name, nothing more. */
+export const bookingEducatorRefSchema = z.object({
+  slug: z.string(),
+  name: z.string(),
+});
+
+/**
+ * An educator a coordinator may assign: approved, with a current background
+ * check. Served alongside the queue rather than from its own endpoint, because
+ * "who can I assign" is only ever asked while working a booking.
+ */
+export const assignableEducatorSchema = bookingEducatorRefSchema.extend({
+  /** Their listed subjects, so a coordinator picks a plausible substitute. */
+  subjects: z.array(z.string()),
+});
+
+export type AssignableEducator = z.infer<typeof assignableEducatorSchema>;
+
+/**
+ * One row of the coordinator's queue.
+ *
+ * **No decrypted child data.** The learner appears as an age band only; their
+ * first name and the in-home address live behind
+ * `GET /bookings/:id/child-details`, which audits the access. A list endpoint
+ * that decrypted them would write an audit row per refresh, or — worse — no row
+ * at all, and §5 requires child-data access to be attributable.
+ */
+export const coordinatorBookingSchema = z.object({
+  id: z.string(),
+  reference: z.string(),
+  status: bookingStatusSchema,
+
+  /** Who the parent asked for, and who was dispatched. Null until confirmed. */
+  requestedEducator: bookingEducatorRefSchema,
+  assignedEducator: bookingEducatorRefSchema.nullable(),
+
+  parentName: z.string(),
+  parentEmail: z.string(),
+  parentPhone: z.string().nullable(),
+
+  learnerAgeBand: learnerAgeBandSchema,
+  subjectSlug: z.string(),
+  subjectTopic: z.string(),
+  format: bookingFormatSchema,
+  durationMinutes: z.number().int(),
+
+  preferredDate: z.string(),
+  preferredTime: z.string(),
+  alternateTime: z.string().nullable(),
+  flexibleTime: z.boolean(),
+
+  currency: z.string(),
+  totalCents: z.number().int(),
+  /** Internal figures — staff-only, never on a parent-facing response. */
+  educatorEarningsCents: z.number().int(),
+  platformMarginCents: z.number().int(),
+  amountRefundedCents: z.number().int(),
+  /**
+   * What is still refundable: settled minus already refunded. Derived from the
+   * payment rather than from `totalCents`, because what can be given back is
+   * what actually arrived — a booking whose payment never settled has a total
+   * and nothing to refund.
+   */
+  refundableCents: z.number().int(),
+  lineItems: z.array(quoteLineItemSchema),
+
+  slaDeadline: z.iso.datetime(),
+  createdAt: z.iso.datetime(),
+  confirmedAt: z.iso.datetime().nullable(),
+  cancelledAt: z.iso.datetime().nullable(),
+});
+
+export type CoordinatorBooking = z.infer<typeof coordinatorBookingSchema>;
+
+/**
+ * The child data behind a booking, released one deliberate request at a time and
+ * audited every time. Address is present only for `in_home`.
+ */
+export const bookingChildDetailsSchema = z.object({
+  bookingId: z.string(),
+  learnerFirstName: z.string(),
+  learnerAgeBand: learnerAgeBandSchema,
+  learnerFocus: z.string().nullable(),
+  address: bookingAddressSchema.nullable(),
+});
+
+export type BookingChildDetails = z.infer<typeof bookingChildDetailsSchema>;
+
+/**
+ * `POST /bookings/:id/confirm` — assign one educator and confirm.
+ *
+ * The slug is required rather than defaulting to the requested educator: after
+ * an off-platform phone call the coordinator knows who is actually teaching, and
+ * a silent default is how a substitution would go unrecorded.
+ */
+export const confirmBookingSchema = z
+  .object({
+    educatorSlug: z.string().trim().min(1, "Choose the educator taking this session.").max(60),
+    /** Free-text note from the call, kept on the audit row. */
+    note: z.string().trim().max(500).optional(),
+  })
+  .strict();
+
+export type ConfirmBookingRequest = z.infer<typeof confirmBookingSchema>;
+
+/**
+ * `POST /bookings/:id/cannot-confirm` — the platform can't fulfil this, so the
+ * parent is refunded in full. A reason is mandatory: the parent is told, and the
+ * audit row has to answer "why was this refunded?" without a second system.
+ */
+export const cannotConfirmBookingSchema = z
+  .object({
+    reason: z
+      .string()
+      .trim()
+      .min(3, "Give a reason — the parent is told, and it goes on the audit row.")
+      .max(500),
+  })
+  .strict();
+
+export type CannotConfirmBookingRequest = z.infer<typeof cannotConfirmBookingSchema>;
+
+/**
+ * Discretionary refunds (§5 permission matrix).
+ *
+ * Two different limits, and conflating them is how a refund control goes wrong:
+ *
+ * - **The refundable balance** — captured minus already refunded — binds
+ *   *everyone*, admin included. It isn't policy, it's arithmetic; Stripe would
+ *   reject the excess anyway and the ledger would disagree with reality.
+ * - **The coordinator cap** is policy: how much a coordinator may give back on
+ *   one booking without an admin. Admins are unbounded up to the balance, which
+ *   is what "complete control in a conflict" means here.
+ *
+ * Lives in the contract rather than server constants so the coordinator's screen
+ * can state the ceiling it will be held to, instead of two copies drifting.
+ */
+export const REFUND_POLICY = {
+  /**
+   * Cumulative per booking, not per request — otherwise the cap is decorative,
+   * since three refunds of the cap clear any balance. Counts every refund on the
+   * booking, whoever issued it.
+   */
+  coordinatorCapCents: 10_000,
+} as const;
+
+/**
+ * `POST /bookings/:id/refund` — a discretionary refund, whole or partial.
+ *
+ * Distinct from `cannot-confirm`, which is the platform failing to deliver and
+ * always refunds in full. This is the conflict path: a session went badly, a
+ * family is owed something back, and somebody decides how much.
+ */
+export const refundBookingSchema = z
+  .object({
+    /**
+     * How much to give back, in cents. No "refund everything" flag: an amount
+     * the caller states is an amount they can be shown before they commit and
+     * held to afterwards.
+     */
+    amountCents: z
+      .number()
+      .int("Refunds are whole cents.")
+      .positive("Enter how much to refund."),
+    reason: z
+      .string()
+      .trim()
+      .min(3, "Give a reason — the parent is told, and it goes on the audit row.")
+      .max(500),
+  })
+  .strict();
+
+export type RefundBookingRequest = z.infer<typeof refundBookingSchema>;
+
+/**
+ * One row of the parent's own history. A strict allowlist: the take-rate split,
+ * the educator's earnings, and the platform margin are on the booking but are
+ * internal (§7) and must never reach a parent's browser.
+ */
+export const parentBookingSchema = z.object({
+  id: z.string(),
+  reference: z.string(),
+  status: bookingStatusSchema,
+  requestedEducator: bookingEducatorRefSchema,
+  /** Present once confirmed, and the honest place a substitution shows up. */
+  assignedEducator: bookingEducatorRefSchema.nullable(),
+  subjectTopic: z.string(),
+  format: bookingFormatSchema,
+  durationMinutes: z.number().int(),
+  preferredDate: z.string(),
+  preferredTime: z.string(),
+  alternateTime: z.string().nullable(),
+  flexibleTime: z.boolean(),
+  learnerAgeBand: learnerAgeBandSchema,
+  currency: z.string(),
+  totalCents: z.number().int(),
+  amountRefundedCents: z.number().int(),
+  lineItems: z.array(quoteLineItemSchema),
+  slaDeadline: z.iso.datetime(),
+  createdAt: z.iso.datetime(),
+  confirmedAt: z.iso.datetime().nullable(),
+  cancelledAt: z.iso.datetime().nullable(),
+});
+
+export type ParentBooking = z.infer<typeof parentBookingSchema>;
+
+/**
+ * One session on the assigned educator's own dashboard.
+ *
+ * Only `confirmed` bookings assigned to them ever appear here, so the learner's
+ * first name is included — an educator who can't be told who they are teaching
+ * can't teach. The in-home address is still withheld from the list and released
+ * through the audited detail endpoint.
+ */
+export const educatorAssignmentSchema = z.object({
+  id: z.string(),
+  reference: z.string(),
+  status: bookingStatusSchema,
+  learnerFirstName: z.string(),
+  learnerAgeBand: learnerAgeBandSchema,
+  learnerFocus: z.string().nullable(),
+  subjectTopic: z.string(),
+  format: bookingFormatSchema,
+  durationMinutes: z.number().int(),
+  preferredDate: z.string(),
+  preferredTime: z.string(),
+  /** What this session earns them. Their own figure, so it is theirs to see. */
+  currency: z.string(),
+  earningsCents: z.number().int(),
+  confirmedAt: z.iso.datetime().nullable(),
+});
+
+export type EducatorAssignment = z.infer<typeof educatorAssignmentSchema>;
