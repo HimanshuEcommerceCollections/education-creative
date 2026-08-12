@@ -18,7 +18,8 @@
     "seed:pricing": "tsx scripts/seed-pricing.ts",
     "grant-role": "tsx scripts/grant-role.ts",
     "set-password": "tsx scripts/set-password.ts",
-    "email:test": "tsx scripts/email-test.ts"
+    "email:test": "tsx scripts/email-test.ts",
+    "bookings:sweep": "tsx scripts/sweep-bookings.ts"
   },
   "dependencies": {
     "@aws-sdk/client-sesv2": "^3.1104.0",
