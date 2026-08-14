@@ -143,6 +143,47 @@ check(
   "EMAIL_OUTBOX_FILE",
 );
 
+console.log("\n— stripe test-mode guard —");
+/** A complete, mode-consistent test-key Stripe config. */
+const STRIPE_TEST = {
+  STRIPE_SECRET_KEY: "rk_test_x",
+  STRIPE_PUBLISHABLE_KEY: "pk_test_x",
+  STRIPE_WEBHOOK_SECRET: "whsec_x",
+  STRIPE_PROJECT_KEY: "ylj",
+};
+
+check(
+  "a test key is refused in production by default",
+  { ...PRODUCTION, ...STRIPE_TEST },
+  "STRIPE_SECRET_KEY",
+);
+check(
+  "a test key is accepted in production with the explicit opt-in",
+  { ...PRODUCTION, ...STRIPE_TEST, STRIPE_ALLOW_TEST_MODE: "true" },
+  "ok",
+);
+check(
+  "the opt-in must be removed once the keys are live",
+  {
+    ...PRODUCTION,
+    ...STRIPE_TEST,
+    STRIPE_SECRET_KEY: "rk_live_x",
+    STRIPE_PUBLISHABLE_KEY: "pk_live_x",
+    STRIPE_ALLOW_TEST_MODE: "true",
+  },
+  "STRIPE_ALLOW_TEST_MODE",
+);
+check(
+  "a live production config is accepted without the flag",
+  {
+    ...PRODUCTION,
+    ...STRIPE_TEST,
+    STRIPE_SECRET_KEY: "rk_live_x",
+    STRIPE_PUBLISHABLE_KEY: "pk_live_x",
+  },
+  "ok",
+);
+
 console.log("\n— guards can't be bypassed by a mis-set NODE_ENV —");
 /*
  * This is what the first Vercel deployment actually did: NODE_ENV was not

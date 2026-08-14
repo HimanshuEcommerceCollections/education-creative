@@ -124,6 +124,19 @@ export const envSchema = z
       z.string().regex(/^pk_(test|live)_/, "must start with pk_test_ or pk_live_"),
     ),
     /**
+     * Explicit opt-in to run a production deployment on Stripe *test* keys — a
+     * soft-launch state where the whole checkout flow can be exercised end to
+     * end without a real card ever being charged. Without this flag the guard
+     * below refuses to boot, so test keys can only reach production on purpose.
+     *
+     * Going live is: swap the STRIPE_* values to live mode **and remove this
+     * flag**, so the guard is armed again for every deployment after.
+     */
+    STRIPE_ALLOW_TEST_MODE: z
+      .enum(["true", "false"])
+      .default("false")
+      .transform((value) => value === "true"),
+    /**
      * **Which project owns an object in a shared Stripe account.**
      *
      * This is not a label — it is a safety mechanism. A Stripe account delivers
@@ -262,11 +275,27 @@ export const envSchema = z
     const isProductionLike =
       env.NODE_ENV === "production" || env.VERCEL_ENV === "production";
 
-    if (isProductionLike && env.STRIPE_SECRET_KEY?.includes("_test_")) {
+    if (
+      isProductionLike &&
+      env.STRIPE_SECRET_KEY?.includes("_test_") &&
+      !env.STRIPE_ALLOW_TEST_MODE
+    ) {
       ctx.addIssue({
         code: "custom",
         path: ["STRIPE_SECRET_KEY"],
-        message: "is a test key — production would take no real payments",
+        message:
+          "is a test key — production would take no real payments (set STRIPE_ALLOW_TEST_MODE=true only for a deliberate test-mode soft launch)",
+      });
+    }
+
+    // The flag must go when the keys do: leaving it set after go-live would let
+    // a test key slip back into a later deployment unnoticed.
+    if (env.STRIPE_ALLOW_TEST_MODE && env.STRIPE_SECRET_KEY?.includes("_live_")) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["STRIPE_ALLOW_TEST_MODE"],
+        message:
+          "STRIPE_SECRET_KEY is live — remove this flag so the test-key guard is armed again",
       });
     }
 
