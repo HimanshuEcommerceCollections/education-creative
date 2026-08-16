@@ -4,6 +4,13 @@ export interface EmailMessage {
   /** Plain text is always provided; HTML is optional per-template. */
   text: string;
   html?: string;
+  /**
+   * Where a reply should land. Set centrally from `EMAIL_REPLY_TO`, because
+   * several templates tell the recipient to reply — an expiring invite says so as
+   * its only recovery route — and `EMAIL_FROM` is typically a no-reply sender
+   * that silently discards them.
+   */
+  replyTo?: string;
 }
 
 /**

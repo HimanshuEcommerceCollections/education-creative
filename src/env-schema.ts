@@ -54,6 +54,35 @@ export const envSchema = z
     FIELD_ENCRYPTION_KEY: base64Key32,
 
     /**
+     * Shared secret proving a request came from the Next BFF rather than from
+     * anyone who found this service's URL.
+     *
+     * Optional so an existing deployment keeps working, but until it is set on
+     * both halves the API is an open endpoint whose `x-client-ip` header — the
+     * rate-limit key, and the IP written to consent and audit rows — is supplied
+     * by the caller. `app.ts` warns loudly at boot when it is absent.
+     */
+    INTERNAL_API_SECRET: optionalText(z.string().min(32)),
+
+    /**
+     * Bearer secret for the scheduled-sweep routes, which run on a timer and so
+     * have no session to authenticate. Absent means those routes are closed.
+     */
+    CRON_SECRET: optionalText(z.string().min(16)),
+
+    /**
+     * Not a setting — a refusal.
+     *
+     * Staff authentication is password-only by an explicit locked decision, and
+     * nothing in this service reads an MFA flag. Left undeclared it would parse
+     * clean and do nothing, so an operator reading the deployment's variables
+     * would reasonably conclude staff MFA is enforced when it is not. Rejecting
+     * it means a misleading security setting cannot sit in an environment
+     * unnoticed. See the `superRefine` below for the message.
+     */
+    MFA_REQUIRED: z.unknown().optional(),
+
+    /**
      * Which `EmailService` driver to construct. Business logic never names a
      * provider, so switching is a config change only.
      *   console — prints to stdout; development default, rejected in production
@@ -63,6 +92,15 @@ export const envSchema = z
      */
     EMAIL_DRIVER: z.enum(["console", "smtp", "resend", "ses"]).default("console"),
     EMAIL_FROM: z.string().min(3),
+    /**
+     * Where replies land, when `EMAIL_FROM` is a no-reply sender.
+     *
+     * Several templates tell the recipient to reply — for an expiring invite that
+     * is the only recovery route offered — so without this those instructions go
+     * to an address nobody reads. Left unset only when `EMAIL_FROM` is itself a
+     * monitored mailbox.
+     */
+    EMAIL_REPLY_TO: optionalText(z.email()),
     /**
      * Development only. When set, the console driver appends every message to
      * this path as JSONL so the e2e scripts can read the single-use tokens that
@@ -200,6 +238,19 @@ export const envSchema = z
           message: "must be false on port 587 (STARTTLS)",
         });
       }
+    }
+
+    /*
+     * Present in any form — including blank — is a misconfiguration, because the
+     * variable's only possible effect is to mislead whoever reads it.
+     */
+    if (env.MFA_REQUIRED !== undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["MFA_REQUIRED"],
+        message:
+          "is not read by this service — staff authentication is password-only by design, so a set flag claims an enforcement that does not exist. Remove the variable.",
+      });
     }
 
     if (env.EMAIL_DRIVER === "resend") {

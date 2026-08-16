@@ -43,6 +43,27 @@ async function main() {
 
   if (!user) usage(`No account found for ${email}.`);
 
+  /*
+   * Nothing else can grant the admin role — `seed:admin` only bootstraps, and there
+   * is no role-grant endpoint yet — so revoking the last one leaves the platform
+   * with no way to invite staff, approve educators, or grant the role back. Only
+   * live accounts count: a soft-deleted admin cannot sign in to undo this.
+   */
+  if (revoke && role === "admin") {
+    const admins = await db
+      .select({ userId: userRoles.userId })
+      .from(userRoles)
+      .innerJoin(users, eq(userRoles.userId, users.id))
+      .where(and(eq(userRoles.role, "admin"), isNull(users.deletedAt)));
+
+    if (admins.length <= 1) {
+      usage(
+        `Refusing to revoke the last remaining admin role (${email}). ` +
+          "Grant admin to another account first.",
+      );
+    }
+  }
+
   if (revoke) {
     const removed = await db
       .delete(userRoles)
@@ -55,12 +76,16 @@ async function main() {
     }
 
     await recordAudit(db, {
-      actorId: user.id,
+      // Null, not the subject. Passing `user.id` recorded that the demoted user
+      // demoted themselves, which inverts the one fact the row exists to carry.
+      // `audit_log.actor_id` is nullable for CLI and timer actions; the operator
+      // marker below identifies the path, and no fake uuid is invented.
+      actorId: null,
       action: "user.role_revoked",
       entityType: "user_roles",
       entityId: user.id,
-      before: { role },
-      after: null,
+      before: { role, subject: email },
+      after: { operator: "cli:grant-role" },
     });
     logger.warn(
       { email, role },
@@ -81,11 +106,13 @@ async function main() {
   }
 
   await recordAudit(db, {
-    actorId: user.id,
+    // See the revoke branch: the actor is an operator at a terminal, not the
+    // account being promoted.
+    actorId: null,
     action: "user.role_granted",
     entityType: "user_roles",
     entityId: user.id,
-    after: { role, grantedBy: "cli" },
+    after: { role, subject: email, operator: "cli:grant-role" },
   });
 
   logger.info({ email, role }, "role granted");

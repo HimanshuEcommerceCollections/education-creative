@@ -184,6 +184,31 @@ check(
   "ok",
 );
 
+console.log("\n— a variable that claims a control we don't have —");
+/*
+ * MFA_REQUIRED=true was set on a production deployment and read by nothing. The
+ * object isn't strict, so it parsed clean; an operator reading the dashboard would
+ * reasonably conclude staff MFA was enforced. Staff auth is password-only by
+ * design, so the variable is refused rather than ignored.
+ */
+check("MFA_REQUIRED is rejected outright", { MFA_REQUIRED: "true" }, "MFA_REQUIRED");
+check("even set to false, because its presence is the problem", { MFA_REQUIRED: "false" }, "MFA_REQUIRED");
+check("and blank, so a leftover empty variable is still caught", { MFA_REQUIRED: "" }, "MFA_REQUIRED");
+
+console.log("\n— the BFF→API hop —");
+check("no internal secret is allowed (existing deployments keep booting)", {}, "ok");
+check(
+  "a real one is accepted",
+  { INTERNAL_API_SECRET: "s".repeat(43) },
+  "ok",
+);
+check(
+  "a short one is refused — it's a shared secret, not a password",
+  { INTERNAL_API_SECRET: "too-short" },
+  "INTERNAL_API_SECRET",
+);
+check("a cron secret is optional", { CRON_SECRET: "c".repeat(32) }, "ok");
+
 console.log("\n— guards can't be bypassed by a mis-set NODE_ENV —");
 /*
  * This is what the first Vercel deployment actually did: NODE_ENV was not

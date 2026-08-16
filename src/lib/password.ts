@@ -92,15 +92,27 @@ function parsePhc(encoded: string): ParsedHash | null {
 /**
  * Never throws on an absent or malformed hash — a corrupt row has to read as a
  * failed login, not a 500 that confirms to an attacker that the account exists.
+ *
+ * The absent and malformed cases burn a derivation before answering. Returning
+ * immediately would make an *invited* account — educator or staff, awaiting
+ * acceptance, so `passwordHash` is still null — answer in about a millisecond
+ * where a real account takes a full hash, which enumerates precisely the
+ * invite-only addresses this design most wants hidden.
  */
 export async function verifyPassword(
   passwordHash: string | null,
   password: string,
 ): Promise<boolean> {
-  if (!passwordHash) return false;
+  if (!passwordHash) {
+    await fakeVerifyDelay();
+    return false;
+  }
 
   const parsed = parsePhc(passwordHash);
-  if (!parsed) return false;
+  if (!parsed) {
+    await fakeVerifyDelay();
+    return false;
+  }
 
   try {
     const candidate = await derive(password, parsed.salt, parsed.params);
@@ -113,8 +125,8 @@ export async function verifyPassword(
 
 /**
  * Burns comparable CPU to a real verification. Called when the email doesn't
- * exist or the account has no password, so response timing can't be used to
- * enumerate accounts.
+ * exist, and by `verifyPassword` itself when the account has no usable hash, so
+ * response timing can't be used to enumerate accounts.
  */
 export async function fakeVerifyDelay(): Promise<void> {
   await derive("timing-equalisation-placeholder", randomBytes(SALT_BYTES), PARAMS);

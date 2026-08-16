@@ -122,3 +122,34 @@ export const ledgerStatusEnum = pgEnum("ledger_status", [
   "at_risk",
   "reversed",
 ]);
+
+/**
+ * A review is invisible until a human publishes it. `rejected` is kept rather than
+ * deleted so a parent can't be told twice to write one, and so a moderation
+ * decision stays auditable.
+ */
+export const reviewStatusEnum = pgEnum("review_status", [
+  "pending",
+  "published",
+  "rejected",
+]);
+
+/** Why someone wrote in. Mirrors the four options the contact form offers. */
+export const contactReasonEnum = pgEnum("contact_reason", [
+  "finding_educator",
+  "pricing",
+  "booking_help",
+  "other",
+]);
+
+/**
+ * `spam` is a terminal side exit rather than a delete: a public form attracts
+ * junk, and burying it keeps the abuse signal (and the address that sent it)
+ * without it sitting in the queue someone is trying to work.
+ */
+export const contactRequestStatusEnum = pgEnum("contact_request_status", [
+  "new",
+  "in_progress",
+  "resolved",
+  "spam",
+]);

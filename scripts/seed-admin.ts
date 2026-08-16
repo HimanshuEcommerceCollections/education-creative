@@ -42,11 +42,40 @@ async function main(): Promise<void> {
     .limit(1);
 
   if (existing) {
-    await db
+    const granted = await db
       .insert(userRoles)
       .values({ userId: existing.id, role: "admin" })
-      .onConflictDoNothing();
-    logger.info({ email: normalisedEmail }, "existing account now holds the admin role");
+      .onConflictDoNothing()
+      .returning({ id: userRoles.id });
+
+    if (granted.length === 0) {
+      logger.info({ email: normalisedEmail }, "account already holds the admin role");
+      return;
+    }
+
+    /*
+     * This branch is a privilege escalation on an account that already existed —
+     * possibly one that self-signed-up as a customer — so it has to leave a trace, or
+     * a routine deploy seed quietly mints an admin. Audited with a null actor and an
+     * operator marker, same as the CLI role scripts.
+     */
+    await recordAudit(db, {
+      actorId: null,
+      action: "user.role_granted",
+      entityType: "user_roles",
+      entityId: existing.id,
+      after: {
+        role: "admin",
+        subject: normalisedEmail,
+        operator: "cli:seed-admin",
+        escalatedExistingAccount: true,
+      },
+    });
+
+    logger.warn(
+      { email: normalisedEmail },
+      "an existing account was escalated to admin — verify this address is meant to be one",
+    );
     return;
   }
 
@@ -76,12 +105,13 @@ async function main(): Promise<void> {
     });
 
     await recordAudit(tx, {
-      actorId: userId,
-      actorRole: "admin",
+      // An operator at a terminal, not the account being created — it did not
+      // exist a statement ago and cannot have been the actor.
+      actorId: null,
       action: "user.seeded_first_admin",
       entityType: "users",
       entityId: userId,
-      after: { email: normalisedEmail },
+      after: { email: normalisedEmail, operator: "cli:seed-admin" },
     });
   });
 

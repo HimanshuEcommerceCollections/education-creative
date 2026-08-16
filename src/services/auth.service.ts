@@ -27,13 +27,16 @@ import {
   users,
 } from "../db/schema/index.ts";
 import { AppError, invalidCredentials } from "../lib/app-error.ts";
+import { logger } from "../lib/logger.ts";
 import { fakeVerifyDelay, hashPassword, verifyPassword } from "../lib/password.ts";
 import { USERS_EMAIL_CONSTRAINT, isUniqueViolation } from "../lib/pg-errors.ts";
 import { sha256Hex } from "../lib/tokens.ts";
-import { recordAudit, recordAuditDetached } from "./audit.service.ts";
+import { recordAudit } from "./audit.service.ts";
 import { trySend } from "./email/index.ts";
 import {
+  educatorInviteTemplate,
   passwordResetTemplate,
+  staffInviteTemplate,
   verifyEmailTemplate,
 } from "./email/templates.ts";
 import { consumeEmailToken, issueEmailToken } from "./email-token.service.ts";
@@ -43,6 +46,7 @@ import {
   loadRoles,
   resolveSession,
   revokeAllSessionsForUser,
+  revokeOtherSessionsForUser,
   toSessionResponse,
 } from "./session.service.ts";
 
@@ -55,6 +59,24 @@ export interface RequestContext {
 /** Case-insensitive lookup, matching the `lower(email)` unique index. */
 function whereEmail(email: string) {
   return and(rawSql`lower(${users.email}) = ${email}`, isNull(users.deletedAt));
+}
+
+/**
+ * Turns a `users.email` unique violation into the caller's friendly conflict, and
+ * returns every other error untouched — an unexpected unique violation is a bug
+ * and must surface as one, not as a field error.
+ *
+ * Exported because every path that inserts a `users` row races the same index.
+ * The "this email already has an account" checks in the educator-approval and
+ * staff-invite flows run outside their transaction with no lock, so two concurrent
+ * approvals both pass the check and the loser arrives here; routing it through
+ * this is what stops that being an unmapped 500.
+ *
+ *   throw mapUserEmailConflict(error, "That email already has an account.");
+ */
+export function mapUserEmailConflict(error: unknown, message: string): unknown {
+  if (!isUniqueViolation(error, USERS_EMAIL_CONSTRAINT)) return error;
+  return new AppError("email_in_use", message, { fieldErrors: { email: message } });
 }
 
 // ---------------------------------------------------------------------------
@@ -73,10 +95,13 @@ export async function signup(
   input: SignupRequest,
   ctx: RequestContext,
 ): Promise<LoginResponse> {
+  // Hashed before the transaction opens. Argon2id here is ~1.4s of pure-JS
+  // derivation, and doing it inside would hold one of ten pooled connections for
+  // all of it — `resetPassword` and `acceptInvite` already order it this way.
+  const passwordHash = await hashPassword(input.password);
+
   const result = await db
     .transaction(async (tx) => {
-      const passwordHash = await hashPassword(input.password);
-
       const [user] = await tx
         .insert(users)
         .values({
@@ -140,14 +165,7 @@ export async function signup(
       return { userId, user: user!, issued, verificationToken: verification.token };
     })
     .catch((error: unknown) => {
-      // Matched to the email index specifically: any *other* unique violation in
-      // this transaction is a bug and must surface as one, not as a field error.
-      if (isUniqueViolation(error, USERS_EMAIL_CONSTRAINT)) {
-        throw new AppError("email_in_use", "That email already has an account.", {
-          fieldErrors: { email: "That email already has an account." },
-        });
-      }
-      throw error;
+      throw mapUserEmailConflict(error, "That email already has an account.");
     });
 
   // Outside the transaction: a provider outage must not roll back the account,
@@ -173,6 +191,18 @@ export async function signup(
 // Login — the single entry point for all four roles
 // ---------------------------------------------------------------------------
 
+/**
+ * The order of the checks below is load-bearing.
+ *
+ * Nothing about an account's *state* — locked, suspended, roleless — is disclosed
+ * before the password has been verified. Checking the lock first made eight junk
+ * attempts followed by a ninth a pre-auth oracle for whether an address exists at
+ * all, which contradicts `invalidCredentials`' whole reason for being identical
+ * across "no such email", "wrong password" and "no password set". So a locked
+ * account still cannot authenticate, but a *guesser* only ever sees the standard
+ * invalid-credentials reply, with a full Argon2id verification's worth of work
+ * spent either way.
+ */
 export async function login(
   input: LoginRequest,
   ctx: RequestContext,
@@ -184,8 +214,6 @@ export async function login(
       fullName: users.fullName,
       passwordHash: users.passwordHash,
       status: users.status,
-      failedLoginCount: users.failedLoginCount,
-      lockedUntil: users.lockedUntil,
     })
     .from(users)
     .where(whereEmail(input.email))
@@ -195,42 +223,69 @@ export async function login(
     // Spend comparable CPU so response time doesn't reveal whether the
     // address exists.
     await fakeVerifyDelay();
-    recordAuditDetached({
+    await recordAudit(db, {
       action: "auth.login_failed",
       entityType: "users",
-      after: { reason: "unknown_email" },
+      // The attempted address is the point: without it a sweep through a
+      // thousand addresses is a thousand indistinguishable rows. Only the
+      // address — never the submitted password, which would make this log a
+      // credential list.
+      after: { reason: "unknown_email", attemptedEmail: input.email },
       ip: ctx.ip,
       requestId: ctx.requestId,
     });
     throw invalidCredentials();
   }
 
-  if (user.lockedUntil && user.lockedUntil > new Date()) {
+  const passwordOk = await verifyPassword(user.passwordHash, input.password);
+
+  if (!passwordOk) {
+    const lockedNow = await registerFailedAttempt(user.id);
+    await recordAudit(db, {
+      actorId: user.id,
+      action: lockedNow ? "auth.account_locked" : "auth.login_failed",
+      entityType: "users",
+      entityId: user.id,
+      after: lockedNow
+        ? { reason: "too_many_failed_attempts", lockMinutes: LOCKOUT.lockMinutes }
+        : { reason: "bad_password" },
+      ip: ctx.ip,
+      requestId: ctx.requestId,
+    });
+    throw invalidCredentials();
+  }
+
+  // Correct password, so the lock can be named without telling a guesser
+  // anything they didn't already know. It is still enforced: holding the right
+  // password does not end the window early.
+  if (await isLocked(user.id)) {
+    await recordAudit(db, {
+      actorId: user.id,
+      action: "auth.login_blocked",
+      entityType: "users",
+      entityId: user.id,
+      after: { reason: "account_locked" },
+      ip: ctx.ip,
+      requestId: ctx.requestId,
+    });
     throw new AppError(
       "account_locked",
       "Too many attempts. Try again in a few minutes, or reset your password.",
     );
   }
 
-  const passwordOk = await verifyPassword(user.passwordHash, input.password);
-
-  if (!passwordOk) {
-    await registerFailedAttempt(user.id, user.failedLoginCount);
-    recordAuditDetached({
-      actorId: user.id,
-      action: "auth.login_failed",
-      entityType: "users",
-      entityId: user.id,
-      after: { reason: "bad_password" },
-      ip: ctx.ip,
-      requestId: ctx.requestId,
-    });
-    throw invalidCredentials();
-  }
-
   // An invited account has no password yet, so `passwordOk` above can only be
   // true once they've accepted. Anything other than active still can't sign in.
   if (user.status !== "active") {
+    await recordAudit(db, {
+      actorId: user.id,
+      action: "auth.login_blocked",
+      entityType: "users",
+      entityId: user.id,
+      after: { reason: "account_inactive", status: user.status },
+      ip: ctx.ip,
+      requestId: ctx.requestId,
+    });
     throw new AppError(
       "account_inactive",
       user.status === "invited"
@@ -244,7 +299,17 @@ export async function login(
 
   if (!activeRole) {
     // Authenticated but capability-less. Shouldn't occur (approval grants the
-    // role in the same transaction as the account) — fail closed if it does.
+    // role in the same transaction as the account) — fail closed if it does, and
+    // record it, because "shouldn't occur" is exactly what wants evidence.
+    await recordAudit(db, {
+      actorId: user.id,
+      action: "auth.login_blocked",
+      entityType: "users",
+      entityId: user.id,
+      after: { reason: "no_role_granted" },
+      ip: ctx.ip,
+      requestId: ctx.requestId,
+    });
     throw new AppError(
       "account_inactive",
       "This account doesn't have access configured yet. Please contact support.",
@@ -265,7 +330,12 @@ export async function login(
     }),
   );
 
-  recordAuditDetached({
+  // Awaited, not detached. On a serverless invocation the instance can freeze the
+  // moment the response completes, so a fire-and-forget insert lands or doesn't
+  // depending on timing — and a login record the schema says is always written
+  // must not be a coin flip. One indexed insert is an acceptable cost on a path
+  // that already spent a full password hash.
+  await recordAudit(db, {
     actorId: user.id,
     actorRole: activeRole,
     action: staff ? "auth.staff_login" : "auth.login",
@@ -286,19 +356,55 @@ export async function login(
   };
 }
 
-async function registerFailedAttempt(userId: string, currentCount: number): Promise<void> {
-  const nextCount = currentCount + 1;
-  const shouldLock = nextCount >= LOCKOUT.maxFailedAttempts;
+/**
+ * Counts one failed attempt and locks the account if that attempt is the one that
+ * reaches the threshold. Returns whether it just locked.
+ *
+ * Both the increment and the lock decision are SQL, in a single statement. Reading
+ * the counter in the initial SELECT, spending a full Argon2id verification, then
+ * writing `count + 1` computed in JavaScript is a lost update: two hundred
+ * concurrent guesses all read zero, all write one, and `maxFailedAttempts` is
+ * never reached no matter how many attempts are made in parallel — which is
+ * precisely the attack the lockout exists to stop.
+ *
+ * `lockedUntil` is never written back to null here. Blanking it on a non-locking failure
+ * lets a slow request that failed *earlier* clear a lock a later one has just set.
+ * Clearing belongs to successful login and to password reset, both of which have earned
+ * it.
+ */
+async function registerFailedAttempt(userId: string): Promise<boolean> {
+  const nextCount = rawSql`${users.failedLoginCount} + 1`;
+  const locking = rawSql`${nextCount} >= ${LOCKOUT.maxFailedAttempts}`;
 
-  await db
+  const [row] = await db
     .update(users)
     .set({
-      failedLoginCount: shouldLock ? 0 : nextCount,
-      lockedUntil: shouldLock
-        ? new Date(Date.now() + LOCKOUT.lockMinutes * 60_000)
-        : null,
+      // Reset at the moment of locking, so the window that follows starts fresh.
+      failedLoginCount: rawSql`case when ${locking} then 0 else ${nextCount} end`,
+      lockedUntil: rawSql`case when ${locking} then now() + make_interval(mins => ${LOCKOUT.lockMinutes}) else ${users.lockedUntil} end`,
     })
-    .where(eq(users.id, userId));
+    .where(eq(users.id, userId))
+    .returning({ failedLoginCount: users.failedLoginCount });
+
+  // The same statement zeroes the counter exactly when it sets the lock, so a
+  // zero coming back means this attempt was the one that tripped it.
+  return row?.failedLoginCount === 0;
+}
+
+/**
+ * Whether the lock window is still open, compared in the database rather than in
+ * JS — for the same reason `resolveSession` filters session expiry in SQL: a
+ * clock-skewed instance must not decide a lock has passed when the row says it
+ * hasn't.
+ */
+async function isLocked(userId: string): Promise<boolean> {
+  const [row] = await db
+    .select({ locked: rawSql<boolean>`${users.lockedUntil} > now()` })
+    .from(users)
+    .where(eq(users.id, userId))
+    .limit(1);
+
+  return row?.locked === true;
 }
 
 async function clearFailedAttempts(userId: string): Promise<void> {
@@ -333,6 +439,10 @@ export async function verifyEmail(token: string, ctx: RequestContext): Promise<v
 /**
  * Always resolves, whether or not the address exists — the caller returns the
  * same message either way, so this can't be used to test for accounts.
+ *
+ * The send is deliberately not awaited: an identical *message* is no use if a real
+ * address takes a provider round trip (bounded at 8s) and an unknown one returns
+ * after a single SELECT. Latency was the oracle the copy was written to close.
  */
 export async function resendVerification(email: string): Promise<void> {
   const [user] = await db
@@ -352,7 +462,7 @@ export async function resendVerification(email: string): Promise<void> {
   const { token } = await db.transaction((tx) =>
     issueEmailToken(tx, user.id, "email_verification"),
   );
-  await sendTemplate(user.email, verifyEmailTemplate(user.fullName, token), {
+  sendTemplateDetached(user.email, verifyEmailTemplate(user.fullName, token), {
     purpose: "email_verification_resend",
     userId: user.id,
   });
@@ -362,7 +472,7 @@ export async function resendVerification(email: string): Promise<void> {
 // Password reset
 // ---------------------------------------------------------------------------
 
-/** Same non-enumerating contract as `resendVerification`. */
+/** Same non-enumerating contract as `resendVerification`, send included. */
 export async function requestPasswordReset(email: string): Promise<void> {
   const [user] = await db
     .select({
@@ -383,7 +493,7 @@ export async function requestPasswordReset(email: string): Promise<void> {
   const { token } = await db.transaction((tx) =>
     issueEmailToken(tx, user.id, "password_reset"),
   );
-  await sendTemplate(user.email, passwordResetTemplate(user.fullName, token), {
+  sendTemplateDetached(user.email, passwordResetTemplate(user.fullName, token), {
     purpose: "password_reset",
     userId: user.id,
   });
@@ -461,12 +571,30 @@ export async function acceptInvite(
         failedLoginCount: 0,
         lockedUntil: null,
       })
-      .where(eq(users.id, consumed.userId))
+      /*
+       * Keyed on the state as well as the id. Keyed on the id alone, a still-live
+       * invite for an account that has since been suspended or soft-deleted would
+       * flip it back to `active` with a password of the holder's choosing — the
+       * read-only peek route checks `status = 'invited'` for exactly this reason,
+       * and the write is the half that matters.
+       */
+      .where(
+        and(
+          eq(users.id, consumed.userId),
+          eq(users.status, "invited"),
+          isNull(users.deletedAt),
+        ),
+      )
       .returning({ id: users.id });
 
+    // Zero rows means the token was live but the account is no longer invitable.
     if (!updated) {
       throw new AppError("invalid_token", "That invite is no longer valid.");
     }
+
+    // An invited account shouldn't hold a session, but if anything issued one
+    // before the password existed, accepting is the moment it stops being valid.
+    await revokeAllSessionsForUser(tx, consumed.userId);
 
     // Idempotent: an account invited, then re-invited, keeps one identity row.
     await tx
@@ -552,7 +680,17 @@ export async function createInvitedUser(
       phone: input.phone ?? null,
       status: "invited",
     })
-    .returning({ id: users.id });
+    .returning({ id: users.id })
+    .catch((error: unknown) => {
+      // Callers check for an existing account before opening their transaction,
+      // unlocked, so two concurrent approvals for one address both pass that
+      // check and one of them lands here. The index is the actual guarantee.
+      throw mapUserEmailConflict(
+        error,
+        "That email already has an account. Grant the role to the existing user " +
+          "instead of sending an invite.",
+      );
+    });
 
   const userId = user!.id;
 
@@ -564,6 +702,168 @@ export async function createInvitedUser(
 
   const { token } = await issueEmailToken(tx, userId, "invite");
   return { userId, token };
+}
+
+/**
+ * Re-issues an invite for an account still waiting to accept one.
+ *
+ * Invite recovery has no other route: `forgot-password` refuses an account with no
+ * password hash, `resend-verification` refuses a non-active one, and re-running the
+ * approval collides on the email unique index — so without this a lost or expired invite
+ * leaves the invitee with nothing to click and an admin with nothing to click either.
+ *
+ * `issueEmailToken` consumes any outstanding invite token first, so the previous
+ * link stops working the moment this one is sent; there is never more than one
+ * live invite per account.
+ */
+export async function resendInvite(
+  userId: string,
+  actor: AuthenticatedPrincipal,
+  ctx: RequestContext,
+): Promise<{ email: string; sent: boolean }> {
+  const [user] = await db
+    .select({
+      id: users.id,
+      email: users.email,
+      fullName: users.fullName,
+      status: users.status,
+    })
+    .from(users)
+    .where(and(eq(users.id, userId), isNull(users.deletedAt)))
+    .limit(1);
+
+  if (!user) throw new AppError("not_found", "No such account.");
+
+  // Only an account that has never accepted. Anything else is a password reset or
+  // a support conversation, not a second invite.
+  if (user.status !== "invited") {
+    throw new AppError(
+      "conflict",
+      "That account has already been set up. Send a password reset instead.",
+    );
+  }
+
+  const roles = await loadRoles(db, user.id);
+  const role = resolveActiveRole(roles);
+  if (!role) {
+    throw new AppError(
+      "conflict",
+      "That invite has no role attached, so there is nothing to accept. Grant the role first.",
+    );
+  }
+
+  const { token } = await db.transaction(async (tx) => {
+    const issued = await issueEmailToken(tx, user.id, "invite");
+
+    await recordAudit(tx, {
+      actorId: actor.userId,
+      actorRole: actor.activeRole,
+      action: "auth.invite_resent",
+      entityType: "users",
+      entityId: user.id,
+      after: { email: user.email, role },
+      ip: ctx.ip,
+      requestId: ctx.requestId,
+    });
+
+    return issued;
+  });
+
+  // Awaited: an admin pressing "resend" is entitled to know whether it went out,
+  // and the token is committed either way so a failure is recoverable by repeating.
+  const sent = await trySend(
+    {
+      ...(role === "educator"
+        ? educatorInviteTemplate(user.fullName, token)
+        : staffInviteTemplate(user.fullName, token, role)),
+      to: user.email,
+    },
+    { purpose: "invite_resend", userId: user.id },
+  );
+
+  return { email: user.email, sent };
+}
+
+// ---------------------------------------------------------------------------
+// Authenticated password change
+// ---------------------------------------------------------------------------
+
+/**
+ * Changes the password of the signed-in account, re-authenticating with the
+ * current one first.
+ *
+ * The re-authentication is the point: a session token alone should not be enough
+ * to replace the credential behind it, or a borrowed browser becomes a permanent
+ * takeover. It is also the only place in this service that asks for a current
+ * password — `/account` linked at the forgot-password flow because this didn't
+ * exist.
+ *
+ * **Every other session is revoked, the caller's is kept.** Someone who has just
+ * proved the current password does not need signing out of the page they did it
+ * from; anyone else holding a session is the reason the password is changing.
+ */
+export async function changePassword(
+  principal: AuthenticatedPrincipal,
+  input: { currentPassword: string; newPassword: string },
+  ctx: RequestContext,
+): Promise<{ revokedSessions: number }> {
+  const [user] = await db
+    .select({ id: users.id, passwordHash: users.passwordHash })
+    .from(users)
+    .where(and(eq(users.id, principal.userId), isNull(users.deletedAt)))
+    .limit(1);
+
+  if (!user) throw new AppError("unauthenticated", "Sign in to continue.");
+
+  if (!(await verifyPassword(user.passwordHash, input.currentPassword))) {
+    /*
+     * Audited but deliberately *not* counted towards lockout: this is reached
+     * only with a valid session, and letting a wrong guess here lock the account
+     * would hand anyone with a stolen token a denial-of-service against its owner.
+     * The rate limit on the route is what bounds it.
+     */
+    await recordAudit(db, {
+      actorId: principal.userId,
+      actorRole: principal.activeRole,
+      action: "auth.password_change_failed",
+      entityType: "users",
+      entityId: principal.userId,
+      after: { reason: "wrong_current_password" },
+      ip: ctx.ip,
+      requestId: ctx.requestId,
+    });
+    throw new AppError("invalid_credentials", "That current password isn't right.", {
+      fieldErrors: { currentPassword: "That current password isn't right." },
+    });
+  }
+
+  const passwordHash = await hashPassword(input.newPassword);
+
+  return db.transaction(async (tx) => {
+    await tx
+      .update(users)
+      .set({ passwordHash, failedLoginCount: 0, lockedUntil: null })
+      .where(eq(users.id, principal.userId));
+
+    const revokedSessions = await revokeOtherSessionsForUser(
+      tx,
+      principal.userId,
+      principal.sessionId,
+    );
+
+    await recordAudit(tx, {
+      actorId: principal.userId,
+      actorRole: principal.activeRole,
+      action: "auth.password_changed",
+      entityType: "users",
+      entityId: principal.userId,
+      after: { revokedSessions },
+      ip: ctx.ip,
+      requestId: ctx.requestId,
+    });
+
+    return { revokedSessions };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -608,4 +908,30 @@ async function sendTemplate(
   context: { purpose: string; userId?: string },
 ): Promise<void> {
   await trySend({ ...template, to }, context);
+}
+
+/**
+ * Starts a send and returns immediately.
+ *
+ * Only for the two endpoints whose contract is that the response is identical
+ * whether or not the address exists. Awaiting there leaks that answer through
+ * latency, which no amount of careful wording in the message fixes. `trySend`
+ * already swallows and logs provider failures; the extra catch covers anything
+ * before it.
+ *
+ * Not to be used for a database write: on a serverless invocation the instance can
+ * freeze at the end of the response, so a detached promise is best-effort — the
+ * price paid here on purpose, and the reason the audit rows in `login` are awaited.
+ */
+function sendTemplateDetached(
+  to: string,
+  template: { to: string; subject: string; text: string; html?: string },
+  context: { purpose: string; userId?: string },
+): void {
+  void sendTemplate(to, template, context).catch((error: unknown) => {
+    logger.error(
+      { err: error, purpose: context.purpose, userId: context.userId },
+      "failed to dispatch email — the recipient needs to ask again",
+    );
+  });
 }

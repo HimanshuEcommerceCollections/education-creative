@@ -85,11 +85,22 @@ export const setEducatorRateSchema = z
 
 export type SetEducatorRate = z.infer<typeof setEducatorRateSchema>;
 
+/**
+ * The admin view of a rate. Two figures, deliberately:
+ *
+ * `rateCents` is what is stored, and `effectiveRateCents` is what the platform
+ * will actually charge — the stored rate clamped into its subject's band. They
+ * differ only for a row written before band edits were validated against
+ * existing rates, and `outsideBand` is what makes that visible instead of the
+ * admin screen quietly disagreeing with the public site.
+ */
 export const educatorRateSchema = z.object({
   educatorSlug: z.string(),
   educatorName: z.string(),
   subjectSlug: z.string(),
   rateCents: z.number().int(),
+  effectiveRateCents: z.number().int(),
+  outsideBand: z.boolean(),
   currency: z.string(),
   effectiveFrom: z.iso.datetime(),
 });

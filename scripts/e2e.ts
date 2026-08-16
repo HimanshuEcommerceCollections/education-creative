@@ -405,20 +405,31 @@ await call("/auth/signup", {
   body: { fullName: "Lock Target", email: lockEmail, password: PASSWORD, consentGiven: true },
   ip: lockIp,
 });
-let lockedAt = 0;
+let disclosedAt = 0;
 let rateLimitedAt = 0;
 for (let attempt = 1; attempt <= 9; attempt += 1) {
   const result = await call("/auth/login", {
     body: { email: lockEmail, password: `wrong-${attempt}` },
     ip: lockIp,
   });
-  if (result.status === 423 && lockedAt === 0) lockedAt = attempt;
+  if (result.status === 423 && disclosedAt === 0) disclosedAt = attempt;
   if (result.status === 429 && rateLimitedAt === 0) rateLimitedAt = attempt;
 }
+/*
+ * A wrong password must answer identically whether or not the account is locked —
+ * and whether or not it exists. Returning `account_locked` here would make the
+ * lockout itself an oracle: eight junk attempts against any address, and the ninth
+ * reply tells an attacker whether that address has an account.
+ *
+ * So the lock is asserted through the *correct* password below, which is the only
+ * caller entitled to learn about it.
+ */
 ok(
-  "repeated failures lock the account",
-  lockedAt > 0,
-  `locked on attempt ${lockedAt}${rateLimitedAt ? `, rate-limited from ${rateLimitedAt}` : ""}`,
+  "a wrong password never discloses that the account is locked",
+  disclosedAt === 0,
+  disclosedAt
+    ? `disclosed on attempt ${disclosedAt}`
+    : `stayed generic${rateLimitedAt ? `, rate-limited from ${rateLimitedAt}` : ""}`,
 );
 const lockedWithGoodPassword = await call("/auth/login", {
   body: { email: lockEmail, password: PASSWORD },

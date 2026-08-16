@@ -115,6 +115,40 @@ export function applicationReceivedTemplate(name: string): EmailMessage {
   };
 }
 
+/**
+ * Sent to whoever wrote in through the public contact form.
+ *
+ * It promises no response time, because nothing measures one yet — a stated
+ * turnaround this platform can't observe is a promise it will break by accident.
+ * Their own message is quoted back so they have a copy of what they sent, and
+ * nothing internal goes with it: no reference, no status, no name of whoever
+ * ends up picking it up.
+ */
+export function contactRequestReceivedTemplate(input: {
+  name: string;
+  message: string;
+}): EmailMessage {
+  return {
+    to: "",
+    subject: `We've got your message · ${SITE_NAME}`,
+    text: [
+      `Hi ${input.name},`,
+      "",
+      "Thanks for getting in touch. Your message has reached our team and someone",
+      "will come back to you by email. There's nothing you need to do in the",
+      "meantime.",
+      "",
+      "Here's what you sent us:",
+      "",
+      // Indented so a multi-line message reads as a quotation of theirs rather
+      // than as more of ours.
+      ...input.message.split("\n").map((line) => `  ${line}`),
+      "",
+      signOff,
+    ].join("\n"),
+  };
+}
+
 /** `$58` / `$82.50` — cents in, no trailing `.00`, so a price reads as a price. */
 function money(cents: number, currency: string): string {
   const whole = cents % 100 === 0;
@@ -267,6 +301,136 @@ export function bookingAssignedTemplate(input: {
       "",
       "The learner's details and, for in-home sessions, the address are on your",
       "dashboard — we don't put them in email:",
+      "",
+      webUrl("/educator/sessions"),
+      "",
+      `Reference: ${input.reference}`,
+      "",
+      signOff,
+    ].join("\n"),
+  };
+}
+
+/**
+ * Sent to both sides when a session moves. One template rather than two because
+ * the two times are the whole message and must read identically to everyone
+ * holding the date; `audience` only decides which dashboard is linked and which
+ * wording is honest for the reader.
+ *
+ * The old time and the new one are labelled and on their own lines. A sentence
+ * carrying both — "moved from X to Y" — is the one shape a skim-reader inverts,
+ * and the cost of that is a family at home on the wrong afternoon.
+ */
+export function bookingRescheduledTemplate(input: {
+  recipientName: string;
+  reference: string;
+  previousWhen: string;
+  newWhen: string;
+  reason: string;
+  audience: "parent" | "educator";
+}): EmailMessage {
+  const forParent = input.audience === "parent";
+  return {
+    to: "",
+    subject: `Your session has moved · ${input.reference}`,
+    text: [
+      `Hi ${input.recipientName},`,
+      "",
+      forParent
+        ? "We've moved your session to a new time."
+        : "A session you're teaching has moved to a new time.",
+      "",
+      `  Was:  ${input.previousWhen}`,
+      `  Now:  ${input.newWhen}`,
+      "",
+      `Why: ${input.reason}`,
+      "",
+      forParent
+        ? "Nothing else has changed — same session, same educator, same price."
+        : "Nothing else has changed — same session, same learner.",
+      "",
+      `Reference: ${input.reference}`,
+      "",
+      forParent
+        ? "If that time doesn't work after all, reply to this email and a person will pick it up."
+        : "If that time doesn't work for you, reply to this email and we'll sort it out.",
+      "",
+      webUrl(forParent ? "/account/bookings" : "/educator/sessions"),
+      "",
+      signOff,
+    ].join("\n"),
+  };
+}
+
+/**
+ * Sent to the parent when the educator on a confirmed session changes.
+ *
+ * The new name leads: "who is teaching my child on Saturday" is the only
+ * question this answers. The previous educator is named to place the change, not
+ * to account for it — the reason line does that.
+ */
+export function bookingReassignedTemplate(input: {
+  parentName: string;
+  reference: string;
+  educatorName: string;
+  /** Null only where the booking carried no assignment to begin with. */
+  previousEducatorName: string | null;
+  when: string;
+  reason: string;
+}): EmailMessage {
+  return {
+    to: "",
+    subject: `A change of educator · ${input.reference}`,
+    text: [
+      `Hi ${input.parentName},`,
+      "",
+      input.previousEducatorName
+        ? `${input.educatorName} will now be taking your session on ${input.when}, instead of ${input.previousEducatorName}.`
+        : `${input.educatorName} will now be taking your session on ${input.when}.`,
+      "",
+      `Why: ${input.reason}`,
+      "",
+      "The time, the session and the price are unchanged.",
+      "",
+      `Reference: ${input.reference}`,
+      "",
+      "If you'd rather not go ahead with this educator, reply to this email and a",
+      "person will pick it up with you.",
+      "",
+      webUrl("/account/bookings"),
+      "",
+      signOff,
+    ].join("\n"),
+  };
+}
+
+/**
+ * Sent to the educator a session has been taken away from.
+ *
+ * Blunt, and first thing in the message: an educator who still believes they are
+ * teaching on Saturday is exactly the failure this exists to prevent, and a
+ * polite lead-in is what buries it. Carries no learner name and no address, like
+ * every other message to an educator (§5/§9).
+ */
+export function bookingUnassignedTemplate(input: {
+  educatorName: string;
+  reference: string;
+  when: string;
+  subjectTopic: string;
+  reason: string;
+}): EmailMessage {
+  return {
+    to: "",
+    subject: `A session is no longer yours · ${input.reference}`,
+    text: [
+      `Hi ${input.educatorName},`,
+      "",
+      `The ${input.subjectTopic} session on ${input.when} has been passed to another`,
+      "educator. Please don't attend it.",
+      "",
+      `Why: ${input.reason}`,
+      "",
+      "Your other sessions are unaffected:",
       "",
       webUrl("/educator/sessions"),
       "",

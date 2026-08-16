@@ -103,7 +103,15 @@ export async function trySend(
   context: { purpose: string; userId?: string },
 ): Promise<boolean> {
   try {
-    await withTimeout(emailService.send(message), SEND_TIMEOUT_MS);
+    // Applied centrally so no template has to remember it: the templates that
+    // say "reply to this email" would otherwise be pointing at a no-reply sender.
+    const addressed = {
+      ...message,
+      ...(env.EMAIL_REPLY_TO && !message.replyTo
+        ? { replyTo: env.EMAIL_REPLY_TO }
+        : {}),
+    };
+    await withTimeout(emailService.send(addressed), SEND_TIMEOUT_MS);
     return true;
   } catch (error) {
     logger.error(

@@ -2,7 +2,7 @@ import { and, eq, isNull } from "drizzle-orm";
 
 import type { QuoteRequest, QuoteResponse } from "../contracts/bookings.ts";
 import { RATE_SANITY } from "../contracts/pricing.ts";
-import { BOOKING_POLICY } from "../constants.ts";
+import { FLAG_MESSAGES } from "../constants.ts";
 import { db, type DbOrTx } from "../db/client.ts";
 import {
   educatorProfiles,
@@ -14,6 +14,7 @@ import {
 } from "../db/schema/index.ts";
 import { AppError } from "../lib/app-error.ts";
 import { logger } from "../lib/logger.ts";
+import { assertFlagEnabled, getEffectiveConfig } from "./config.service.ts";
 
 /**
  * The pricing engine (ARCHITECTURE.md §7).
@@ -28,8 +29,8 @@ import { logger } from "../lib/logger.ts";
  * There is deliberately no second copy of a price in this file.
  *
  * One duration basis: the same `durationHours` drives the parent's charge and the
- * educator's earnings. A separate "length multiplier" for billing was how the
- * original design produced negative margins on long sessions.
+ * educator's earnings. A separate "length multiplier" for billing is how a pricing model
+ * ends up with negative margins on long sessions.
  */
 
 const PLATFORM_CURRENCY = "USD";
@@ -152,9 +153,10 @@ export async function priceSession(
     durationMinutes: number;
   },
 ): Promise<Omit<ResolvedQuote, "id" | "expiresAt">> {
-  const [ratePerHourCents, policy] = await Promise.all([
+  const [ratePerHourCents, policy, config] = await Promise.all([
     resolveRate(dbOrTx, input.educatorProfileId, input.subjectId),
     resolveFormatPolicy(dbOrTx),
+    getEffectiveConfig(),
   ]);
 
   const durationHours = input.durationMinutes / 60;
@@ -192,12 +194,16 @@ export async function priceSession(
    * Because the take is a slice of the same gross, `educatorEarnings ≤ total`
    * holds by construction. There is no arithmetic here that can pay an educator
    * more than the platform collected.
+   *
+   * The take rate is read live from site configuration and **frozen onto the
+   * quote row below**, so an admin editing it never re-prices a quote already
+   * issued — the stored figure is what reconciliation and any later replay use.
    */
-  const takeCents = Math.round((totalCents * BOOKING_POLICY.takeRateBps) / 10_000);
+  const takeCents = Math.round((totalCents * config.platform.takeRateBps) / 10_000);
   const educatorEarningsCents = totalCents - takeCents;
   const expectedFeeCents =
-    Math.round((totalCents * BOOKING_POLICY.expectedStripeFeeBps) / 10_000) +
-    BOOKING_POLICY.expectedStripeFeeFlatCents;
+    Math.round((totalCents * config.platform.expectedStripeFeeBps) / 10_000) +
+    config.platform.expectedStripeFeeFlatCents;
   const platformMarginCents = totalCents - educatorEarningsCents - expectedFeeCents;
 
   /*
@@ -205,7 +211,7 @@ export async function priceSession(
    * flagged for review and sold anyway, which is the version of this rule that
    * quietly bleeds a marketplace.
    */
-  if (platformMarginCents < BOOKING_POLICY.minMarginCents) {
+  if (platformMarginCents < config.platform.minMarginCents) {
     throw new AppError(
       "conflict",
       "We can't take this booking online right now. Please contact us and we'll arrange it.",
@@ -233,7 +239,7 @@ export async function priceSession(
     lineItems,
     totalCents,
     effectiveRatePerHourCents: ratePerHourCents,
-    takeRateBps: BOOKING_POLICY.takeRateBps,
+    takeRateBps: config.platform.takeRateBps,
     educatorEarningsCents,
     platformMarginCents,
     expectedFeeCents,
@@ -277,16 +283,24 @@ export async function requireSubject(dbOrTx: DbOrTx, slug: string) {
 /**
  * Rejects a topic the educator doesn't list.
  *
- * Skipped when the profile has no topics recorded, so an educator seeded before
- * this column existed stays bookable rather than becoming unbookable — but any
- * profile that *does* list topics is enforced, which is what stops a hand-crafted
- * request booking "Astrophysics" with an arts teacher.
+ * This is what stops a hand-crafted request booking "Astrophysics" with an arts
+ * teacher, so an empty list is refused rather than waved through: it means nobody
+ * has recorded what this educator teaches, and skipping the check for exactly
+ * those profiles would turn the guard off for the least-vetted ones. Every
+ * profile can be filled in through the educator endpoints, so an empty list is a
+ * profile to finish, not a state to price against.
  */
 export function assertTeachesTopic(
   educator: { subjects: string[]; name: string },
   topic: string,
 ): void {
-  if (educator.subjects.length === 0) return;
+  if (educator.subjects.length === 0) {
+    throw new AppError(
+      "conflict",
+      `We can't take a booking for ${educator.name} yet — their subjects aren't set up.`,
+      { fieldErrors: { subjectTopic: "Choose another educator for now." } },
+    );
+  }
   if (educator.subjects.includes(topic)) return;
 
   throw new AppError("validation_failed", `${educator.name} doesn't teach that.`, {
@@ -305,6 +319,8 @@ export async function createQuote(
   customerProfileId: string,
   input: QuoteRequest,
 ): Promise<QuoteResponse> {
+  await assertFlagEnabled("bookingsEnabled", FLAG_MESSAGES.bookingsPaused);
+
   const educator = await requireEducator(db, input.educatorSlug);
   const subject = await requireSubject(db, input.subjectSlug);
   assertTeachesTopic(educator, input.subjectTopic);
@@ -317,7 +333,8 @@ export async function createQuote(
     durationMinutes: input.durationMinutes,
   });
 
-  const expiresAt = new Date(Date.now() + BOOKING_POLICY.quoteTtlMinutes * 60_000);
+  const { booking } = await getEffectiveConfig();
+  const expiresAt = new Date(Date.now() + booking.quoteTtlMinutes * 60_000);
 
   const [row] = await db
     .insert(quotes)

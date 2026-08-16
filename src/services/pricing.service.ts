@@ -1,4 +1,4 @@
-import { and, asc, eq, isNull } from "drizzle-orm";
+import { and, asc, eq, gt, isNull, lt, or, sql as rawSql } from "drizzle-orm";
 
 import type {
   PricingAdminView,
@@ -87,11 +87,45 @@ async function currentRates(dbOrTx: DbOrTx) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Pairs each in-force rate with the figure the platform will actually use: the
+ * stored rate clamped into its subject's band, which is the same arithmetic the
+ * quote engine applies.
+ *
+ * **Both reads go through this**, so the admin screen and the public site can never
+ * disagree about an educator's price. Clamped separately, the admin is the one left
+ * showing a number no page would ever charge. `upsertRateBand` refuses a band that
+ * would need clamping, so `outsideBand` should only ever be true for rows that predate
+ * that check; it is logged for exactly that reason.
+ */
+function withEffectiveRates(
+  bands: Awaited<ReturnType<typeof currentBands>>,
+  rates: Awaited<ReturnType<typeof currentRates>>,
+) {
+  const bandBySubject = new Map(bands.map((band) => [band.subjectSlug, band]));
+
+  return rates.map((rate) => {
+    const band = bandBySubject.get(rate.subjectSlug);
+    const effectiveRateCents = band
+      ? Math.min(Math.max(rate.rateCents, band.minCents), band.maxCents)
+      : rate.rateCents;
+    const outsideBand = effectiveRateCents !== rate.rateCents;
+
+    if (outsideBand) {
+      logger.warn(
+        { educator: rate.educatorSlug, subject: rate.subjectSlug, effectiveRateCents },
+        "educator rate outside its subject band — serving the clamped figure",
+      );
+    }
+
+    return { ...rate, effectiveRateCents, outsideBand };
+  });
+}
+
+/**
  * The public snapshot every price on the site renders from. Allowlisted — no
- * take-rate, no margin, no history. Rates are **clamped into their subject's
- * band here**, at read time: if an admin narrows a band past an existing rate,
- * live pages show the clamped figure (and the drift is logged for staff to
- * reconcile) rather than a number outside the platform's own rules.
+ * take-rate, no margin, no history. Rates are the **effective** figures, so a
+ * band that no longer contains a stored rate can't put a number outside the
+ * platform's own rules on a live page.
  */
 export async function getPricingSnapshot(): Promise<PricingSnapshot> {
   const [bands, rates, policy] = await Promise.all([
@@ -100,23 +134,7 @@ export async function getPricingSnapshot(): Promise<PricingSnapshot> {
     currentFormatPolicy(db),
   ]);
 
-  const bandBySubject = new Map(bands.map((band) => [band.subjectSlug, band]));
-
-  const clampedRates = rates.map((rate) => {
-    const band = bandBySubject.get(rate.subjectSlug);
-    if (!band) return { ...rate, clamped: false };
-    const clampedCents = Math.min(Math.max(rate.rateCents, band.minCents), band.maxCents);
-    return { ...rate, rateCents: clampedCents, clamped: clampedCents !== rate.rateCents };
-  });
-
-  for (const rate of clampedRates) {
-    if (rate.clamped) {
-      logger.warn(
-        { educator: rate.educatorSlug, subject: rate.subjectSlug },
-        "educator rate outside its subject band — serving the clamped figure",
-      );
-    }
-  }
+  const effectiveRates = withEffectiveRates(bands, rates);
 
   return {
     currency: PLATFORM_CURRENCY,
@@ -129,21 +147,27 @@ export async function getPricingSnapshot(): Promise<PricingSnapshot> {
       suggestedCents: band.suggestedCents,
       maxCents: band.maxCents,
     })),
-    educatorRates: clampedRates.map((rate) => ({
+    educatorRates: effectiveRates.map((rate) => ({
       educatorSlug: rate.educatorSlug,
       subjectSlug: rate.subjectSlug,
-      rateCents: rate.rateCents,
+      rateCents: rate.effectiveRateCents,
     })),
   };
 }
 
-/** The admin dashboard's current-state view — same rows, unclamped, with names. */
+/**
+ * The admin dashboard's current-state view — the same rows with names, carrying
+ * both the stored rate and the effective one so a drift between them is visible
+ * on the screen that can fix it.
+ */
 export async function getPricingAdminView(): Promise<PricingAdminView> {
   const [bands, rates, policy] = await Promise.all([
     currentBands(db),
     currentRates(db),
     currentFormatPolicy(db),
   ]);
+
+  const effectiveRates = withEffectiveRates(bands, rates);
 
   return {
     bands: bands.map((band) => ({
@@ -155,11 +179,13 @@ export async function getPricingAdminView(): Promise<PricingAdminView> {
       currency: band.currency,
       effectiveFrom: band.effectiveFrom.toISOString(),
     })),
-    educatorRates: rates.map((rate) => ({
+    educatorRates: effectiveRates.map((rate) => ({
       educatorSlug: rate.educatorSlug,
       educatorName: rate.educatorName,
       subjectSlug: rate.subjectSlug,
       rateCents: rate.rateCents,
+      effectiveRateCents: rate.effectiveRateCents,
+      outsideBand: rate.outsideBand,
       currency: rate.currency,
       effectiveFrom: rate.effectiveFrom.toISOString(),
     })),
@@ -185,7 +211,15 @@ async function requireSubject(slug: string) {
   return subject;
 }
 
-/** Sets a subject's band: closes the row in force, inserts the new version. */
+/**
+ * Sets a subject's band: closes the row in force, inserts the new version.
+ *
+ * Refuses a band that wouldn't contain a rate already in force. Allowed through, such a
+ * narrowing is silent — every affected educator's public price drops to the new ceiling
+ * at read time with only a log line to say so — and a money edit that re-prices people
+ * who weren't named in it is exactly the kind that has to fail loudly rather than be
+ * reported into the void.
+ */
 export async function upsertRateBand(
   input: UpsertRateBand,
   actor: AuthenticatedPrincipal,
@@ -194,6 +228,8 @@ export async function upsertRateBand(
   const subject = await requireSubject(input.subjectSlug);
 
   await db.transaction(async (tx) => {
+    await assertBandContainsExistingRates(tx, subject.id, input);
+
     const [previous] = await tx
       .update(subjectRateBands)
       .set({ effectiveTo: new Date() })
@@ -233,6 +269,62 @@ export async function upsertRateBand(
       requestId: ctx.requestId,
     });
   });
+}
+
+/**
+ * The in-force rates a proposed band would leave stranded.
+ *
+ * Run inside the caller's transaction, so a rate being set at the same moment
+ * either lands before this reads it or waits behind the band's own write.
+ */
+async function assertBandContainsExistingRates(
+  tx: DbOrTx,
+  subjectId: string,
+  input: UpsertRateBand,
+): Promise<void> {
+  const stranded = await tx
+    .select({
+      educatorName: educatorProfiles.name,
+      educatorSlug: educatorProfiles.slug,
+      rateCents: educatorRates.rateCents,
+    })
+    .from(educatorRates)
+    .innerJoin(educatorProfiles, eq(educatorRates.educatorProfileId, educatorProfiles.id))
+    .where(
+      and(
+        eq(educatorRates.subjectId, subjectId),
+        isNull(educatorRates.effectiveTo),
+        isNull(educatorProfiles.deletedAt),
+        or(
+          lt(educatorRates.rateCents, input.minCents),
+          gt(educatorRates.rateCents, input.maxCents),
+        ),
+      ),
+    )
+    .orderBy(asc(educatorProfiles.name));
+
+  if (stranded.length === 0) return;
+
+  const named = stranded
+    .slice(0, 3)
+    .map((rate) => `${rate.educatorName} ($${rate.rateCents / 100}/hr)`)
+    .join(", ");
+  const rest = stranded.length > 3 ? ` and ${stranded.length - 3} more` : "";
+
+  const fieldErrors: Record<string, string> = {};
+  if (stranded.some((rate) => rate.rateCents < input.minCents)) {
+    fieldErrors.minCents = "Above a rate already in force.";
+  }
+  if (stranded.some((rate) => rate.rateCents > input.maxCents)) {
+    fieldErrors.maxCents = "Below a rate already in force.";
+  }
+
+  throw new AppError(
+    "validation_failed",
+    `That band would leave ${stranded.length} rate(s) outside it — ${named}${rest}. ` +
+      "Move those rates first; a band edit must not re-price an educator silently.",
+    { fieldErrors },
+  );
 }
 
 /**
@@ -297,10 +389,26 @@ export async function setEducatorRate(
       createdBy: actor.userId,
     });
 
-    // Keeps the browse grid's cached "from" figure honest without a join.
+    /*
+     * Keeps the browse grid's cached "from" figure honest without a join.
+     * Recomputed across every rate this educator has in force, not set to the one
+     * just edited — assigning the latest edit made a multi-subject educator's
+     * public "from" price whichever subject was saved most recently, which is not
+     * a minimum and is visibly wrong to anyone reading the card.
+     */
+    const [lowest] = await tx
+      .select({ rateCents: rawSql<number | null>`min(${educatorRates.rateCents})` })
+      .from(educatorRates)
+      .where(
+        and(
+          eq(educatorRates.educatorProfileId, educator.id),
+          isNull(educatorRates.effectiveTo),
+        ),
+      );
+
     await tx
       .update(educatorProfiles)
-      .set({ minRateCents: input.rateCents })
+      .set({ minRateCents: lowest?.rateCents ?? input.rateCents })
       .where(eq(educatorProfiles.id, educator.id));
 
     await recordAudit(tx, {
