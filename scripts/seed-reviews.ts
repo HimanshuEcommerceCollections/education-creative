@@ -50,6 +50,14 @@ if (env.NODE_ENV === "production" || process.env.VERCEL_ENV === "production") {
   process.exit(1);
 }
 
+/*
+ * As in `seed-bookings`: the environment check above cannot see that a
+ * development machine is pointed at the production database, so the host has to
+ * be named explicitly.
+ */
+const { assertSeedTarget } = await import("../src/lib/seed-guard.ts");
+assertSeedTarget("seed-reviews");
+
 const { eq, sql } = await import("drizzle-orm");
 const { closeDatabase, db } = await import("../src/db/client.ts");
 const { authIdentities, payments, userRoles, users } = await import(
