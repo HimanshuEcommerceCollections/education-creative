@@ -47,6 +47,14 @@ if (env.NODE_ENV === "production" || process.env.VERCEL_ENV === "production") {
   process.exit(1);
 }
 
+/*
+ * The check above only reads this machine's environment, which says "development"
+ * even when `DATABASE_URL` points at production — exactly how invented bookings
+ * ended up in the real database. This one asks which database is configured.
+ */
+const { assertSeedTarget } = await import("../src/lib/seed-guard.ts");
+assertSeedTarget("seed-bookings");
+
 const { and, eq, isNull, sql } = await import("drizzle-orm");
 const { closeDatabase, db } = await import("../src/db/client.ts");
 const { authIdentities, payments, userRoles, users } = await import(
