@@ -27,6 +27,7 @@ export class ResendEmailDriver implements EmailService {
         subject: message.subject,
         text: message.text,
         ...(message.html ? { html: message.html } : {}),
+        ...(message.replyTo ? { reply_to: [message.replyTo] } : {}),
       }),
     });
 

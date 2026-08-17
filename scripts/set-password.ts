@@ -7,6 +7,10 @@
  * clear the lockout counters, and drop every session, because a credential
  * change that leaves old sessions alive isn't a credential change.
  *
+ * It also leaves the account able to *use* that password — active, with the
+ * verification and age-gate stamps set if they were missing. Anything less
+ * produced an account that still failed login, which is no recovery at all.
+ *
  *   npm run set-password -- someone@example.com 'new-password'
  *   npm run set-password -- someone@example.com 'short' --allow-weak
  */
@@ -53,7 +57,25 @@ async function main() {
   await db.transaction(async (tx) => {
     await tx
       .update(users)
-      .set({ passwordHash, failedLoginCount: 0, lockedUntil: null })
+      .set({
+        passwordHash,
+        failedLoginCount: 0,
+        lockedUntil: null,
+        /*
+         * A password alone does not make a usable account: login refuses anything
+         * whose status isn't `active`, so an account recovered with only a rehash
+         * still failed with `account_inactive` — the exact case the docstring above
+         * claims this script covers.
+         */
+        status: "active",
+        /*
+         * Coalesced, so an already-verified address keeps its original timestamp.
+         * The operator running this out-of-band is the attestation for both, the
+         * same reasoning `acceptInvite` uses for an invited account.
+         */
+        emailVerifiedAt: rawSql`coalesce(${users.emailVerifiedAt}, now())`,
+        ageGateAttestedAt: rawSql`coalesce(${users.ageGateAttestedAt}, now())`,
+      })
       .where(eq(users.id, user.id));
 
     // An invited or OAuth-only account had no password identity until now.
@@ -65,14 +87,30 @@ async function main() {
     await revokeAllSessionsForUser(tx, user.id);
 
     await recordAudit(tx, {
-      actorId: user.id,
+      // Null, not the subject: attributing this to `user.id` recorded that the
+      // account changed its own password, which is the one thing that did not
+      // happen. `audit_log.actor_id` is nullable for exactly this, and the marker
+      // below says which operator path did it — no invented uuid stands in.
+      actorId: null,
       action: "auth.password_set_by_operator",
       entityType: "users",
       entityId: user.id,
+      before: { status: user.status },
+      after: { operator: "cli:set-password", status: "active" },
     });
   });
 
-  logger.info({ email, status: user.status }, "password set — all sessions revoked");
+  logger.info(
+    { email, previousStatus: user.status },
+    "password set — sessions revoked, status set to active, email and age-gate stamped if unset",
+  );
+
+  if (user.status !== "active") {
+    logger.warn(
+      { email, previousStatus: user.status },
+      "this account was not active before: it can now sign in",
+    );
+  }
 
   if (newPassword!.length < PASSWORD_MIN_LENGTH) {
     logger.warn(

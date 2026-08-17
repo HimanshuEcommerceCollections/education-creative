@@ -16,10 +16,13 @@
     "db:studio": "drizzle-kit studio",
     "seed:admin": "tsx scripts/seed-admin.ts",
     "seed:pricing": "tsx scripts/seed-pricing.ts",
+    "seed:bookings": "tsx scripts/seed-bookings.ts",
+    "seed:reviews": "tsx scripts/seed-reviews.ts",
     "grant-role": "tsx scripts/grant-role.ts",
     "set-password": "tsx scripts/set-password.ts",
     "email:test": "tsx scripts/email-test.ts",
-    "bookings:sweep": "tsx scripts/sweep-bookings.ts"
+    "bookings:sweep": "tsx scripts/sweep-bookings.ts",
+    "auth:purge": "tsx scripts/purge-sessions.ts"
   },
   "dependencies": {
     "@aws-sdk/client-sesv2": "^3.1104.0",

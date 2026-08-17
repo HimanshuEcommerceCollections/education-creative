@@ -22,6 +22,27 @@
       "when": 1786396058875,
       "tag": "0002_bright_sumo",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1786902283027,
+      "tag": "0003_naive_the_spike",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1786907930727,
+      "tag": "0004_abnormal_warhawk",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1786916491480,
+      "tag": "0005_round_glorian",
+      "breakpoints": true
     }
   ]
 }

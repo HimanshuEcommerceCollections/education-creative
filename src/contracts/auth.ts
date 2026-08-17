@@ -128,6 +128,25 @@ export const resetPasswordRequestSchema = z
   .strict();
 
 /**
+ * Changing a password while signed in, which needs the current one.
+ *
+ * `currentPassword` deliberately isn't `passwordSchema`: a password created under
+ * an older, shorter minimum has to stay usable to re-authenticate with, exactly as
+ * it is at login. Only the replacement is held to today's policy.
+ */
+export const changePasswordRequestSchema = z
+  .object({
+    currentPassword: z
+      .string()
+      .min(1, "Enter your current password.")
+      .max(PASSWORD_MAX_LENGTH),
+    newPassword: passwordSchema,
+  })
+  .strict();
+
+export type ChangePasswordRequest = z.infer<typeof changePasswordRequestSchema>;
+
+/**
  * Shared by educator and staff invites — both were created by someone else and
  * are choosing their first password. The age-gate attestation is captured here
  * because it was never captured at signup for these accounts.

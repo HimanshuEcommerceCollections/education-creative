@@ -2,6 +2,7 @@ import type { FastifyReply, FastifyRequest } from "fastify";
 
 import { AppError } from "../lib/app-error.ts";
 import { rateLimitStore } from "../services/rate-limit/index.ts";
+import { clientIp } from "./request-context.ts";
 
 export interface RateLimitOptions {
   /** Requests allowed per window. */
@@ -23,15 +24,15 @@ export interface RateLimitOptions {
 }
 
 /**
- * The real client address. `request.ip` is Vercel's edge under the BFF, so
- * limiting on it would put every user in one bucket — the forwarded header is the
- * only meaningful key. It's trusted because this service isn't reachable by
- * browsers directly.
+ * What the counter is keyed on.
+ *
+ * `clientIp` reads the BFF's forwarded header only on a hop that authenticated
+ * itself — see `request-context.ts`. Without that condition an attacker rotates
+ * one header to get a fresh bucket per request, which makes every limit here
+ * decorative.
  */
 function clientKey(request: FastifyRequest): string {
-  const forwarded = request.headers["x-client-ip"];
-  const clientIp = Array.isArray(forwarded) ? forwarded[0] : forwarded;
-  return clientIp?.trim() || request.ip || "unknown";
+  return clientIp(request) ?? "unknown";
 }
 
 /**
@@ -79,3 +80,12 @@ export const strictLimit = () => rateLimit({ max: 10, windowSeconds: 10 * 60 });
 
 /** Endpoints a legitimate user might retry a few times. */
 export const moderateLimit = () => rateLimit({ max: 30, windowSeconds: 10 * 60 });
+
+/**
+ * Session introspection and sign-out. Deliberately roomy rather than absent: the
+ * BFF calls `GET /auth/session` on most page loads, and a page with several server
+ * components can call it more than once, so a ten-minute credential-style budget
+ * would break normal browsing. What this stops is an unauthenticated flood of a
+ * route that runs two queries per call.
+ */
+export const sessionLimit = () => rateLimit({ max: 120, windowSeconds: 60 });

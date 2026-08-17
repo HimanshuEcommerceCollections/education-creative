@@ -7,5 +7,15 @@
     }
   },
   "regions": ["iad1"],
-  "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }]
+  "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }],
+  "crons": [
+    {
+      "path": "/bookings/cron/sweep-unconfirmed",
+      "schedule": "0 9 * * *"
+    },
+    {
+      "path": "/auth/cron/purge-sessions",
+      "schedule": "30 4 * * *"
+    }
+  ]
 }

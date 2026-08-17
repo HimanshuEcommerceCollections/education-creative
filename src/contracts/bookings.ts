@@ -61,10 +61,31 @@ export type LearnerAgeBand = (typeof LEARNER_AGE_BANDS)[number];
  */
 export const BOOKING_TIMEZONE = "America/New_York";
 
-/** `YYYY-MM-DD`, a civil date in `BOOKING_TIMEZONE`. */
+/**
+ * `YYYY-MM-DD`, a civil date in `BOOKING_TIMEZONE`.
+ *
+ * The regex alone accepts `2026-13-45` and `2026-02-30`, which then reach the
+ * database, the coordinator's queue and the educator's dashboard as garbage. The
+ * round trip below is what catches them: `Date.UTC` rolls a bad day over into
+ * the next month rather than failing, so putting the numbers in and reading them
+ * back is the only cheap test that they were a date at all.
+ *
+ * Whether the date is *bookable* — far enough out, inside the booking window —
+ * is a policy question and lives in the API, since the figures come from site
+ * configuration and contracts are shared source that imports nothing but zod.
+ */
 export const civilDateSchema = z
   .string()
-  .regex(/^\d{4}-\d{2}-\d{2}$/, "Pick a date for the session.");
+  .regex(/^\d{4}-\d{2}-\d{2}$/, "Pick a date for the session.")
+  .refine((value) => {
+    const [year, month, day] = value.split("-").map(Number);
+    const roundTrip = new Date(Date.UTC(year!, month! - 1, day!));
+    return (
+      roundTrip.getUTCFullYear() === year &&
+      roundTrip.getUTCMonth() === month! - 1 &&
+      roundTrip.getUTCDate() === day
+    );
+  }, "That isn't a date on the calendar.");
 
 /** `HH:MM` on a 24-hour clock, a civil time in `BOOKING_TIMEZONE`. */
 export const civilTimeSchema = z
@@ -296,6 +317,13 @@ export const createBookingResponseSchema = z.object({
    */
   checkoutClientSecret: z.string(),
   /**
+   * When that session stops being payable, as Stripe itself reports it. Carried
+   * so the payment page can say so before the iframe starts failing opaquely,
+   * without keeping its own copy of the window length or trusting the device
+   * clock to agree with Stripe's.
+   */
+  checkoutExpiresAt: z.string(),
+  /**
    * The publishable key for the account that issued that client secret.
    *
    * Returned with the session rather than configured separately in the Next app
@@ -488,6 +516,53 @@ export const cannotConfirmBookingSchema = z
 export type CannotConfirmBookingRequest = z.infer<typeof cannotConfirmBookingSchema>;
 
 /**
+ * `POST /bookings/:id/reschedule` — the session moves to a new time.
+ *
+ * A coordinator reaches this having already spoken to the parent and the
+ * educator, which is why the minimum-notice rule that governs a parent's own
+ * request is not applied here: the call that the notice window exists to allow
+ * has already happened. A date in the past, or beyond the booking window, is
+ * still refused.
+ *
+ * No amount is accepted and none is recomputed — the session is the same length
+ * for the same price, on a different day.
+ */
+export const rescheduleBookingSchema = z
+  .object({
+    preferredDate: civilDateSchema,
+    preferredTime: civilTimeSchema,
+    reason: z
+      .string()
+      .trim()
+      .min(3, "Say why it moved — the parent is told, and it goes on the audit row.")
+      .max(500),
+  })
+  .strict();
+
+export type RescheduleBookingRequest = z.infer<typeof rescheduleBookingSchema>;
+
+/**
+ * `POST /bookings/:id/reassign` — a different educator takes the session.
+ *
+ * Confirmed bookings only: before confirmation there is nobody assigned, and
+ * choosing who teaches is what `confirm` is for. The named educator is held to
+ * the same approval check as a confirm, because "who is alone with this child"
+ * is the same question whichever action asks it.
+ */
+export const reassignBookingSchema = z
+  .object({
+    educatorSlug: z.string().trim().min(1, "Choose the educator taking this session.").max(60),
+    reason: z
+      .string()
+      .trim()
+      .min(3, "Say why it moved — both educators and the parent are told.")
+      .max(500),
+  })
+  .strict();
+
+export type ReassignBookingRequest = z.infer<typeof reassignBookingSchema>;
+
+/**
  * Discretionary refunds (§5 permission matrix).
  *
  * Two different limits, and conflating them is how a refund control goes wrong:
@@ -538,6 +613,75 @@ export const refundBookingSchema = z
   .strict();
 
 export type RefundBookingRequest = z.infer<typeof refundBookingSchema>;
+
+/**
+ * `POST /bookings/:id/outcome` — what actually happened on the day.
+ *
+ * The two terminal states of a delivered booking, and the only writer of
+ * `completedAt`. Without this the state machine dead-ends at `confirmed`: no
+ * reconciliation can distinguish a session that happened from one nobody turned
+ * up to, and the `booking.no_show_refund` policy has nothing to apply to.
+ *
+ * Staff-only and deliberately not the educator's: the educator is a party to the
+ * session, and "did this happen" is the question a refund may hang on.
+ */
+export const BOOKING_OUTCOMES = ["completed", "no_show"] as const;
+export const bookingOutcomeSchema = z
+  .object({
+    outcome: z.enum(BOOKING_OUTCOMES),
+    /** Free-text detail from the call, kept on the audit row. */
+    note: z.string().trim().max(500).optional(),
+  })
+  .strict();
+
+export type BookingOutcome = (typeof BOOKING_OUTCOMES)[number];
+export type BookingOutcomeRequest = z.infer<typeof bookingOutcomeSchema>;
+
+/**
+ * `POST /bookings/:id/cancel` — the parent's own cancellation.
+ *
+ * This is the endpoint behind the promise printed beside the pay button: cancel
+ * `booking.cancellation_window_hours` or more before the session and the
+ * refund is full and automatic. Inside the window it is refused with the policy
+ * stated, not silently downgraded to a partial refund.
+ *
+ * The reason is optional here, unlike every staff-issued refund: a family owes
+ * nobody an explanation, and a mandatory field would only collect empty strings.
+ */
+export const cancelBookingSchema = z
+  .object({
+    reason: z.string().trim().max(500).optional(),
+  })
+  .strict();
+
+export type CancelBookingRequest = z.infer<typeof cancelBookingSchema>;
+
+/**
+ * `POST /bookings/:id/checkout` — pay for a booking that was abandoned at the
+ * payment step.
+ *
+ * A `pending_payment` booking is otherwise unreachable: the client secret is
+ * returned once, by `POST /bookings`, and a closed tab loses it. Starting over
+ * means a second booking row, a second learner row, and — for a parent who keeps
+ * trying — the 10-per-hour booking limit.
+ *
+ * No quote is re-issued and no amount is accepted: the charge is the booking's
+ * own frozen `totalCents`, which is why this is safe to expose at all.
+ */
+export const resumeCheckoutResponseSchema = z.object({
+  bookingId: z.string(),
+  reference: z.string(),
+  /** Stripe Embedded Checkout client secret, as `POST /bookings` returns. */
+  checkoutClientSecret: z.string(),
+  /** Stripe's own deadline for the session behind that secret. */
+  checkoutExpiresAt: z.string(),
+  /** The publishable key for the account that issued that secret. */
+  publishableKey: z.string(),
+  totalCents: z.number().int(),
+  currency: z.string(),
+});
+
+export type ResumeCheckoutResponse = z.infer<typeof resumeCheckoutResponseSchema>;
 
 /**
  * One row of the parent's own history. A strict allowlist: the take-rate split,

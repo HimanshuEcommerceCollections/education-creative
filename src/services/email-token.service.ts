@@ -1,4 +1,4 @@
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, isNotNull, isNull, lt, or } from "drizzle-orm";
 
 import { TOKEN_TTL } from "../constants.ts";
 import { db, type DbOrTx } from "../db/client.ts";
@@ -120,11 +120,36 @@ export async function consumeEmailToken(
   if (!row) {
     throw new AppError("invalid_token", "That link isn't valid. It may already be used.");
   }
-  // Checked after the claim so an expired token is still burned rather than
-  // left live for a retry.
+  /*
+   * Expiry is checked after the claim so no window exists between the two — but
+   * the claim does not survive this throw. Every caller runs inside a
+   * transaction, so rejecting here rolls the `consumedAt` write back and the row
+   * stays unconsumed.
+   *
+   * That is the right outcome, not a leak: an expired token can never be claimed
+   * successfully, and leaving it unconsumed keeps "a token is consumed exactly
+   * when the flow it authorises succeeded" true. `purgeExpiredAuthRows` is what
+   * eventually removes the row.
+   */
   if (row.expiresAt <= now) {
     throw new AppError("token_expired", "That link has expired.");
   }
 
   return { userId: row.userId };
+}
+
+/**
+ * Removes tokens that can no longer authorise anything — consumed, or past their
+ * TTL. Both are dead weight the moment they land, and nothing reads either state.
+ *
+ * Called by `purgeExpiredAuthRows`; see that for how it's driven.
+ */
+export async function deleteStaleEmailTokens(): Promise<number> {
+  const deleted = await db
+    .delete(emailTokens)
+    .where(
+      or(isNotNull(emailTokens.consumedAt), lt(emailTokens.expiresAt, new Date())),
+    )
+    .returning({ id: emailTokens.id });
+  return deleted.length;
 }

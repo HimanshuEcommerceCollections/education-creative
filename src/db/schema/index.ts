@@ -4,4 +4,7 @@ export * from "./profiles.ts";
 export * from "./educators.ts";
 export * from "./pricing.ts";
 export * from "./bookings.ts";
+export * from "./reviews.ts";
+export * from "./contact-requests.ts";
+export * from "./config.ts";
 export * from "./audit.ts";

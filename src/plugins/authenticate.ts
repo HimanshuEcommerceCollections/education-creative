@@ -41,11 +41,20 @@ async function authenticate(request: FastifyRequest, _reply: FastifyReply): Prom
 
   request.principal = principal;
 
-  // Slide the idle window. Deliberately not awaited: it must not add latency to
-  // every authenticated request, and a lost touch only shortens a session.
-  void touchSession(principal).catch((error) => {
+  /*
+   * Slide the idle window. Awaited: an un-awaited promise on serverless races the
+   * end of the response, and the instance freezing first means an active user's
+   * window silently stops sliding until their session simply expires under them.
+   *
+   * The cost is one indexed UPDATE, and `touchSession` skips it entirely unless the
+   * window or `lastSeenAt` has actually moved. A failure is still only logged — a
+   * lost touch shortens a session, which is not worth failing a request over.
+   */
+  try {
+    await touchSession(principal);
+  } catch (error) {
     request.log.warn({ err: error }, "failed to extend session idle window");
-  });
+  }
 }
 
 /**

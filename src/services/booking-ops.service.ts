@@ -1,18 +1,22 @@
-import { and, asc, desc, eq, gt, inArray, isNull, lte } from "drizzle-orm";
+import { and, asc, count, desc, eq, gt, inArray, isNull, lte, notInArray, sql } from "drizzle-orm";
 
 import type { UserRole } from "../contracts/roles.ts";
 import type {
   AssignableEducator,
   BookingChildDetails,
+  BookingOutcomeRequest,
   BookingStatus,
+  CancelBookingRequest,
   CannotConfirmBookingRequest,
   ConfirmBookingRequest,
   CoordinatorBooking,
   EducatorAssignment,
   ParentBooking,
+  ReassignBookingRequest,
   RefundBookingRequest,
+  RescheduleBookingRequest,
 } from "../contracts/bookings.ts";
-import { REFUND_POLICY } from "../contracts/bookings.ts";
+import { BOOKING_STATUSES, REFUND_POLICY } from "../contracts/bookings.ts";
 import { db, type DbOrTx } from "../db/client.ts";
 import {
   bookings,
@@ -24,17 +28,23 @@ import {
   users,
 } from "../db/schema/index.ts";
 import { AppError } from "../lib/app-error.ts";
+import { civilInstant, endOfCivilMonthsAhead, hoursUntil } from "../lib/civil-time.ts";
 import { decryptField } from "../lib/crypto-field.ts";
+import { uuidv7 } from "../lib/id.ts";
 import { logger } from "../lib/logger.ts";
 import { getStripe, idempotencyKey } from "../lib/stripe.ts";
 import type { RequestContext } from "./auth.service.ts";
 import { recordAudit } from "./audit.service.ts";
+import { getEffectiveConfig } from "./config.service.ts";
 import { trySend } from "./email/index.ts";
 import {
   bookingAssignedTemplate,
   bookingConfirmedTemplate,
   bookingCouldNotConfirmTemplate,
+  bookingReassignedTemplate,
   bookingRefundedTemplate,
+  bookingRescheduledTemplate,
+  bookingUnassignedTemplate,
 } from "./email/templates.ts";
 import { requireCustomerProfile } from "./booking.service.ts";
 import type { AuthenticatedPrincipal } from "./session.service.ts";
@@ -90,15 +100,56 @@ function frozenLineItems(frozenQuote: unknown): { label: string; amountCents: nu
 }
 
 /**
- * The staff queue. Defaults to the bookings that need a decision, oldest SLA
- * deadline first — the order a coordinator should work them in, since that is
- * the one that runs out of time first.
+ * How many bookings sit in each status, across the whole table.
+ *
+ * Separate from the queue read because the dashboard shows every status as a tab
+ * and filters one fetched page between them: a count derived from that page would
+ * mean "of the most recent 200", and a tab reading zero because the page ran out
+ * is indistinguishable from a tab that is genuinely empty.
+ */
+export async function countBookingsByStatus(): Promise<Record<BookingStatus, number>> {
+  const rows = await db
+    .select({ status: bookings.status, total: count() })
+    .from(bookings)
+    .groupBy(bookings.status);
+
+  // Every status present, so a caller can read a zero rather than a missing key.
+  const counts = Object.fromEntries(
+    BOOKING_STATUSES.map((status) => [status, 0]),
+  ) as Record<BookingStatus, number>;
+
+  for (const row of rows) counts[row.status] = row.total;
+  return counts;
+}
+
+/**
+ * The staff queue.
+ *
+ * With no statuses named this returns **all** of them, because the dashboard reads
+ * the queue once and filters it into tabs. It used to default to
+ * `paid_unconfirmed`, which combined with a route that refused to accept
+ * `disputed`, `expired` or `pending_payment` meant those bookings could not be
+ * reached from anywhere in the product.
+ *
+ * Ordered by SLA deadline, so what runs out of time first is worked first. That
+ * matters most for `paid_unconfirmed` — the only status with a deadline that
+ * refunds itself — and is a stable, meaningful order for the rest.
  */
 export async function listBookingQueue(options: {
   statuses?: readonly BookingStatus[];
   limit: number;
 }): Promise<CoordinatorBooking[]> {
-  const statuses = options.statuses ?? (["paid_unconfirmed"] as const);
+  const statuses = options.statuses ?? BOOKING_STATUSES;
+
+  /*
+   * A booking with `cancelledAt` set is already being refunded:
+   * `cannotConfirmBooking` writes that stamp immediately and leaves the status for
+   * `charge.refunded` to move, so for a few seconds — or indefinitely, if the
+   * webhook is delayed — the row still reads `paid_unconfirmed`. Without this the
+   * queue keeps offering a decision another coordinator has already made, and the
+   * second click confirms a session whose money is on its way back.
+   */
+  const actionable = statuses.includes("paid_unconfirmed");
 
   const rows = await db
     .select({
@@ -135,7 +186,12 @@ export async function listBookingQueue(options: {
     .innerJoin(learners, eq(bookings.learnerId, learners.id))
     .innerJoin(customerProfiles, eq(bookings.customerProfileId, customerProfiles.id))
     .innerJoin(users, eq(customerProfiles.userId, users.id))
-    .where(inArray(bookings.status, [...statuses]))
+    .where(
+      and(
+        inArray(bookings.status, [...statuses]),
+        actionable ? isNull(bookings.cancelledAt) : undefined,
+      ),
+    )
     .orderBy(asc(bookings.slaDeadline))
     .limit(options.limit);
 
@@ -385,10 +441,34 @@ export async function confirmBooking(
   const result = await db.transaction(async (tx) => {
     const booking = await lockBooking(tx, bookingId);
 
+    /*
+     * Checked *before* the status, because the status doesn't say it.
+     * `cannotConfirmBooking` deliberately leaves the booking `paid_unconfirmed`
+     * for `charge.refunded` to move and writes only `cancelledAt`, so a second
+     * coordinator on the same queue row would otherwise confirm a session and
+     * email a parent whose money has already been sent back.
+     */
+    if (booking.cancelledAt) {
+      throw new AppError(
+        "conflict",
+        "That booking is already being refunded, so it can't be confirmed now.",
+      );
+    }
+
     if (booking.status !== "paid_unconfirmed") {
       throw new AppError(
         "conflict",
-        `That booking is ${STATUS_WORDS[booking.status]}, so it can't be confirmed now.`,
+        /*
+         * A goodwill refund on a booking nobody confirmed leaves it
+         * `partially_refunded` rather than `paid_unconfirmed`, and "partially
+         * refunded" on its own reads as though there is nothing left to do —
+         * when in fact the remaining balance is still going back at the deadline.
+         */
+        booking.status === "partially_refunded" && booking.confirmedAt === null
+          ? "Part of this booking has already been refunded, so it can't be confirmed. " +
+            "The balance goes back automatically at the confirmation deadline — refund " +
+            "the remainder to close it sooner."
+          : `That booking is ${STATUS_WORDS[booking.status]}, so it can't be confirmed now.`,
       );
     }
 
@@ -496,6 +576,394 @@ async function requireApprovedEducator(slug: string) {
 }
 
 // ---------------------------------------------------------------------------
+// Reschedule and reassign — the session moves, the money doesn't
+// ---------------------------------------------------------------------------
+
+/**
+ * The name and inbox of an educator by profile id, for a message that has to
+ * reach them.
+ *
+ * Deliberately not `requireApprovedEducator`: that one guards who may be *given*
+ * a session, and this is for telling someone a session moved or is no longer
+ * theirs. An educator whose background check lapsed this morning still has to be
+ * told not to turn up on Saturday.
+ */
+async function educatorContactById(tx: DbOrTx, educatorProfileId: string) {
+  const [educator] = await tx
+    .select({
+      id: educatorProfiles.id,
+      slug: educatorProfiles.slug,
+      name: educatorProfiles.name,
+      userId: educatorProfiles.userId,
+      email: users.email,
+    })
+    .from(educatorProfiles)
+    .leftJoin(users, eq(educatorProfiles.userId, users.id))
+    .where(eq(educatorProfiles.id, educatorProfileId))
+    .limit(1);
+
+  return educator ?? null;
+}
+
+/**
+ * Rejects a slot a session can't be moved to.
+ *
+ * Pointedly *not* `assertRequestableSlot`'s rule set. The 24-hour minimum notice
+ * that binds a parent's own request exists so a coordinator has time to reach
+ * the educator by phone — and a coordinator reaching this function has just had
+ * that call. Applying it here would refuse the "can you do tomorrow instead?"
+ * that the whole feature is for.
+ *
+ * What survives are the refusals no phone call can fix: a date that isn't on the
+ * calendar, a date already gone, and one past the window the client's calendar
+ * pages to.
+ */
+function assertReschedulableSlot(
+  input: {
+    preferredDate: string;
+    preferredTime: string;
+  },
+  windowMonths: number,
+): void {
+  const startsAt = civilInstant(input.preferredDate, input.preferredTime);
+
+  if (!startsAt) {
+    throw new AppError("validation_failed", "That isn't a date and time we can book.", {
+      fieldErrors: { preferredDate: "Pick a real date for the session." },
+    });
+  }
+
+  if (startsAt.getTime() < Date.now()) {
+    throw new AppError(
+      "validation_failed",
+      "That time has already passed. Pick one that's still ahead.",
+      { fieldErrors: { preferredDate: "Pick a date in the future." } },
+    );
+  }
+
+  if (startsAt.getTime() > endOfCivilMonthsAhead(windowMonths).getTime()) {
+    throw new AppError(
+      "validation_failed",
+      "That's further ahead than we're taking bookings for. Please choose a nearer date.",
+      { fieldErrors: { preferredDate: "Pick a date within the next couple of months." } },
+    );
+  }
+}
+
+/**
+ * Moves a session to a new date and time.
+ *
+ * From `confirmed` **and** `paid_unconfirmed`: a coordinator often agrees a
+ * better slot on the same call that finds an educator, before anything is
+ * confirmed, and forcing that through confirm-then-reschedule would put a time
+ * on the parent's confirmation email that everyone already knows is wrong.
+ *
+ * Nothing about the money moves — not the amount, not the status, and not the
+ * SLA deadline. The assigned educator is left alone too; a substitution is
+ * `reassignBooking`, and doing both at once would email two changes as one.
+ */
+export async function rescheduleBooking(
+  bookingId: string,
+  input: RescheduleBookingRequest,
+  actor: AuthenticatedPrincipal,
+  ctx: RequestContext,
+): Promise<{
+  reference: string;
+  preferredDate: string;
+  preferredTime: string;
+  previousDate: string;
+  previousTime: string;
+}> {
+  // Before the lock is taken: an unbookable slot is a validation failure, and
+  // holding a row lock while deciding that helps nobody.
+  const config = await getEffectiveConfig();
+  assertReschedulableSlot(input, config.booking.windowMonths);
+
+  const result = await db.transaction(async (tx) => {
+    const booking = await lockBooking(tx, bookingId);
+
+    /*
+     * The same hole that let a refunded booking be confirmed. `cancelledAt` is
+     * written the moment a refund is decided and the status waits on
+     * `charge.refunded`, so status alone still reads as a session going ahead —
+     * and a parent whose money is on its way back would get a message telling
+     * them a new time to be home for.
+     */
+    if (booking.cancelledAt) {
+      throw new AppError(
+        "conflict",
+        "That booking is already being refunded, so there's no session to move.",
+      );
+    }
+
+    if (booking.status !== "confirmed" && booking.status !== "paid_unconfirmed") {
+      throw new AppError(
+        "conflict",
+        `That booking is ${STATUS_WORDS[booking.status]}, so it can't be moved now.`,
+      );
+    }
+
+    await tx
+      .update(bookings)
+      .set({
+        preferredDate: input.preferredDate,
+        preferredTime: input.preferredTime,
+        /*
+         * An agreed slot supersedes a stated preference. A second choice left on
+         * the row is a time nobody has discussed since, sitting where the next
+         * coordinator will read it as still offered.
+         */
+        alternateTime: null,
+        flexibleTime: false,
+        /*
+         * `slaDeadline` is deliberately not extended, which looks like an
+         * oversight and isn't. It is the confirm-or-refund clock protecting the
+         * parent's money, not the session time — pushing it out because a session
+         * moved would quietly erode the auto-refund promise made before they paid.
+         */
+      })
+      .where(eq(bookings.id, bookingId));
+
+    await recordAudit(tx, {
+      actorId: actor.userId,
+      actorRole: actor.activeRole,
+      action: "booking.rescheduled",
+      entityType: "booking",
+      entityId: bookingId,
+      before: {
+        status: booking.status,
+        preferredDate: booking.preferredDate,
+        preferredTime: booking.preferredTime,
+        alternateTime: booking.alternateTime,
+        flexibleTime: booking.flexibleTime,
+      },
+      after: {
+        preferredDate: input.preferredDate,
+        preferredTime: input.preferredTime,
+        alternateTime: null,
+        flexibleTime: false,
+        reason: input.reason,
+      },
+      ip: ctx.ip,
+      requestId: ctx.requestId,
+    });
+
+    const educator = booking.assignedEducatorId
+      ? await educatorContactById(tx, booking.assignedEducatorId)
+      : null;
+
+    return { booking, educator };
+  });
+
+  const previousWhen = `${result.booking.preferredDate} at ${result.booking.preferredTime}`;
+  const newWhen = `${input.preferredDate} at ${input.preferredTime}`;
+
+  // Outside the transaction and never fatal, as everywhere else: the session has
+  // already moved, and a mail outage must not roll that back.
+  await trySend(
+    {
+      ...bookingRescheduledTemplate({
+        recipientName: result.booking.parentName,
+        reference: result.booking.reference,
+        previousWhen,
+        newWhen,
+        reason: input.reason,
+        audience: "parent",
+      }),
+      to: result.booking.parentEmail,
+    },
+    { purpose: "booking_rescheduled", userId: result.booking.parentUserId },
+  );
+
+  // Nobody is assigned before a confirm, so this is the half of the flow that
+  // has an educator holding the old date.
+  if (result.educator?.email) {
+    await trySend(
+      {
+        ...bookingRescheduledTemplate({
+          recipientName: result.educator.name,
+          reference: result.booking.reference,
+          previousWhen,
+          newWhen,
+          reason: input.reason,
+          audience: "educator",
+        }),
+        to: result.educator.email,
+      },
+      { purpose: "booking_rescheduled", userId: result.educator.userId ?? undefined },
+    );
+  }
+
+  return {
+    reference: result.booking.reference,
+    preferredDate: input.preferredDate,
+    preferredTime: input.preferredTime,
+    previousDate: result.booking.preferredDate,
+    previousTime: result.booking.preferredTime,
+  };
+}
+
+/**
+ * Hands a confirmed session to a different educator.
+ *
+ * `confirmed` only: before a confirm nobody is assigned, and choosing who
+ * teaches is what `confirmBooking` is for. The named educator goes through the
+ * same `requireApprovedEducator` check a confirm does — "who is alone with this
+ * child" is one question, and it cannot have two answers depending on which
+ * button a coordinator pressed.
+ */
+export async function reassignBooking(
+  bookingId: string,
+  input: ReassignBookingRequest,
+  actor: AuthenticatedPrincipal,
+  ctx: RequestContext,
+): Promise<{
+  reference: string;
+  educatorSlug: string;
+  educatorName: string;
+  previousEducatorSlug: string | null;
+  previousEducatorName: string | null;
+}> {
+  const educator = await requireApprovedEducator(input.educatorSlug);
+
+  const result = await db.transaction(async (tx) => {
+    const booking = await lockBooking(tx, bookingId);
+
+    if (booking.cancelledAt) {
+      throw new AppError(
+        "conflict",
+        "That booking is already being refunded, so there's no session to hand over.",
+      );
+    }
+
+    if (booking.status !== "confirmed") {
+      throw new AppError(
+        "conflict",
+        // `paid_unconfirmed` is the near miss worth naming: there is a session
+        // and a parent, just no assignment yet, and confirm is the door to it.
+        booking.status === "paid_unconfirmed"
+          ? "Nobody is assigned to that booking yet — confirm it with the educator " +
+            "taking the session instead."
+          : `That booking is ${STATUS_WORDS[booking.status]}, so its educator can't be changed now.`,
+      );
+    }
+
+    // A no-op reassignment is a mistake — the wrong row, or the wrong name in the
+    // picker — and silently succeeding would send three emails saying nothing
+    // changed.
+    if (booking.assignedEducatorId === educator.id) {
+      throw new AppError(
+        "validation_failed",
+        `${educator.name} is already taking this session.`,
+        { fieldErrors: { educatorSlug: "Already assigned to this booking." } },
+      );
+    }
+
+    /*
+     * Null only if the assigned profile was hard-deleted out from under the
+     * booking (`on delete set null`). There is then nobody to stand down, and the
+     * reassignment is simply an assignment.
+     */
+    const previous = booking.assignedEducatorId
+      ? await educatorContactById(tx, booking.assignedEducatorId)
+      : null;
+
+    await tx
+      .update(bookings)
+      .set({
+        assignedEducatorId: educator.id,
+        coordinatorId: actor.userId,
+        /*
+         * `educatorProfileId` — who the parent asked for — is untouched. That
+         * column exists precisely so a substitution doesn't rewrite what was
+         * requested, and the parent's history reads honestly afterwards.
+         */
+      })
+      .where(eq(bookings.id, bookingId));
+
+    await recordAudit(tx, {
+      actorId: actor.userId,
+      actorRole: actor.activeRole,
+      action: "booking.reassigned",
+      entityType: "booking",
+      entityId: bookingId,
+      before: { status: booking.status, assignedEducator: previous?.slug ?? null },
+      after: {
+        assignedEducator: educator.slug,
+        requestedEducator: booking.requestedEducatorSlug,
+        substituted: educator.id !== booking.educatorProfileId,
+        reason: input.reason,
+      },
+      ip: ctx.ip,
+      requestId: ctx.requestId,
+    });
+
+    return { booking, previous };
+  });
+
+  const when = `${result.booking.preferredDate} at ${result.booking.preferredTime}`;
+
+  await trySend(
+    {
+      ...bookingReassignedTemplate({
+        parentName: result.booking.parentName,
+        reference: result.booking.reference,
+        educatorName: educator.name,
+        previousEducatorName: result.previous?.name ?? null,
+        when,
+        reason: input.reason,
+      }),
+      to: result.booking.parentEmail,
+    },
+    { purpose: "booking_reassigned", userId: result.booking.parentUserId },
+  );
+
+  // The same message a confirm sends: from the incoming educator's side this is
+  // a session they didn't have and now do, which is all they need to know.
+  if (educator.email) {
+    await trySend(
+      {
+        ...bookingAssignedTemplate({
+          educatorName: educator.name,
+          reference: result.booking.reference,
+          when,
+          subjectTopic: result.booking.subjectTopic,
+          format: result.booking.format,
+        }),
+        to: educator.email,
+      },
+      { purpose: "booking_assigned", userId: educator.userId ?? undefined },
+    );
+  }
+
+  // The one that matters most: an educator who thinks they are teaching on
+  // Saturday and hears nothing turns up, or doesn't and is marked absent.
+  if (result.previous?.email) {
+    await trySend(
+      {
+        ...bookingUnassignedTemplate({
+          educatorName: result.previous.name,
+          reference: result.booking.reference,
+          when,
+          subjectTopic: result.booking.subjectTopic,
+          reason: input.reason,
+        }),
+        to: result.previous.email,
+      },
+      { purpose: "booking_unassigned", userId: result.previous.userId ?? undefined },
+    );
+  }
+
+  return {
+    reference: result.booking.reference,
+    educatorSlug: educator.slug,
+    educatorName: educator.name,
+    previousEducatorSlug: result.previous?.slug ?? null,
+    previousEducatorName: result.previous?.name ?? null,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Can't confirm → refund
 // ---------------------------------------------------------------------------
 
@@ -532,7 +1000,26 @@ export async function cannotConfirmBooking(
   const prepared = await db.transaction(async (tx) => {
     const booking = await lockBooking(tx, bookingId);
 
-    if (booking.status !== "paid_unconfirmed") {
+    // Already decided. Without this the sweep re-refunds and re-emails on every
+    // run, since the status it looks at is the webhook's to change.
+    if (booking.cancelledAt) {
+      throw new AppError(
+        "conflict",
+        "That booking is already being refunded — nothing further to do here.",
+      );
+    }
+
+    /*
+     * `partially_refunded` with no confirm is the same situation as
+     * `paid_unconfirmed`: a goodwill refund moved the status, but nobody has
+     * committed to teaching the session and the remaining balance is still owed
+     * back at the deadline. Excluding it would make a partial refund a dead end.
+     */
+    const awaitingConfirmation =
+      booking.status === "paid_unconfirmed" ||
+      (booking.status === "partially_refunded" && booking.confirmedAt === null);
+
+    if (!awaitingConfirmation) {
       throw new AppError(
         "conflict",
         `That booking is ${STATUS_WORDS[booking.status]}, so there's nothing to refund here.`,
@@ -548,7 +1035,13 @@ export async function cannotConfirmBooking(
         amountRefundedCents: payments.amountRefundedCents,
       })
       .from(payments)
-      .where(and(eq(payments.bookingId, bookingId), eq(payments.status, "succeeded")))
+      /*
+       * The attempt that took money, by what arrived rather than by status: a
+       * booking carrying a goodwill refund has a `partially_refunded` payment row,
+       * and the balance on it is still refundable.
+       */
+      .where(and(eq(payments.bookingId, bookingId), gt(payments.amountReceivedCents, 0)))
+      .orderBy(desc(payments.createdAt))
       .limit(1);
 
     if (!payment?.stripePaymentIntentId) {
@@ -556,6 +1049,12 @@ export async function cannotConfirmBooking(
         "conflict",
         "No settled payment is on this booking yet. Wait for the payment to land before refunding.",
       );
+    }
+
+    // Nothing left to give back — the balance went in an earlier refund whose
+    // webhook hasn't moved the booking yet.
+    if (payment.amountReceivedCents - payment.amountRefundedCents <= 0) {
+      throw new AppError("conflict", "This booking has already been refunded in full.");
     }
 
     await tx
@@ -695,6 +1194,7 @@ export async function refundBooking(
       // The attempt that actually took money. A booking can carry earlier failed
       // or cancelled attempts, and none of those can be given back.
       .where(and(eq(payments.bookingId, bookingId), gt(payments.amountReceivedCents, 0)))
+      .orderBy(desc(payments.createdAt))
       .limit(1);
 
     if (!payment?.stripePaymentIntentId || payment.amountReceivedCents === 0) {
@@ -742,6 +1242,33 @@ export async function refundBooking(
       }
     }
 
+    /*
+     * The running total is advanced here rather than left to the webhook.
+     *
+     * Both ceilings above read `amountRefundedCents`, and `charge.refunded` lands
+     * seconds later — so with the webhook as its only writer, two quick requests each
+     * read a stale figure, both pass a cap they have jointly blown, and a
+     * $100-capped coordinator clears a $500 booking in slices. A SQL expression
+     * rather than a computed literal so the increment is against whatever the row
+     * holds now; the webhook's later `SET` to Stripe's cumulative figure is still
+     * authoritative and reconciles any drift.
+     */
+    await tx
+      .update(payments)
+      .set({
+        amountRefundedCents: sql`${payments.amountRefundedCents} + ${input.amountCents}`,
+      })
+      .where(eq(payments.id, payment.id));
+
+    /*
+     * What makes *this* refund distinct at Stripe. Generated here and committed on
+     * the audit row before the Stripe call, because the running total can't play
+     * that role: two identical repeat refunds computed the same key from it, so
+     * Stripe returned the first refund unchanged and the parent was emailed twice
+     * about money that moved once.
+     */
+    const refundKey = uuidv7();
+
     await recordAudit(tx, {
       actorId: actor.userId,
       actorRole: actor.activeRole,
@@ -757,33 +1284,37 @@ export async function refundBooking(
         reason: input.reason,
         remainingCents: refundable - input.amountCents,
         intentId: payment.stripePaymentIntentId,
+        refundKey,
       },
       ip: ctx.ip,
       requestId: ctx.requestId,
     });
 
-    return { booking, payment, refundable };
+    return { booking, payment, refundable, refundKey };
   });
 
-  await issueRefund({
-    bookingId,
-    intentId: prepared.payment.stripePaymentIntentId!,
-    amountCents: input.amountCents,
-    reason: input.reason,
-    issuedBy: actor.activeRole,
-    /*
-     * Includes what was already refunded, so a double-clicked $10 refund is one
-     * refund while a deliberate second $10 refund is a different one. Keyed on
-     * the booking alone, every refund after the first would be silently
-     * swallowed as a repeat.
-     */
-    keyParts: [
-      "refund",
+  try {
+    await issueRefund({
       bookingId,
-      `${prepared.payment.amountRefundedCents}-${input.amountCents}`,
-    ],
-    ctx,
-  });
+      intentId: prepared.payment.stripePaymentIntentId!,
+      amountCents: input.amountCents,
+      reason: input.reason,
+      issuedBy: actor.activeRole,
+      keyParts: ["refund", bookingId, prepared.refundKey],
+      ctx,
+    });
+  } catch (error) {
+    // Stripe refused, so the optimistic increment has to come back off — leaving
+    // it would shrink the refundable balance permanently for money that stayed
+    // put. `charge.refunded` never arrives to correct it.
+    await db
+      .update(payments)
+      .set({
+        amountRefundedCents: sql`greatest(0, ${payments.amountRefundedCents} - ${input.amountCents})`,
+      })
+      .where(eq(payments.id, prepared.payment.id));
+    throw error;
+  }
 
   const remaining = prepared.refundable - input.amountCents;
 
@@ -890,14 +1421,27 @@ async function lockBooking(tx: DbOrTx, bookingId: string) {
       id: bookings.id,
       reference: bookings.reference,
       status: bookings.status,
+      customerProfileId: bookings.customerProfileId,
       educatorProfileId: bookings.educatorProfileId,
       assignedEducatorId: bookings.assignedEducatorId,
       subjectTopic: bookings.subjectTopic,
       format: bookings.format,
       preferredDate: bookings.preferredDate,
       preferredTime: bookings.preferredTime,
+      alternateTime: bookings.alternateTime,
+      flexibleTime: bookings.flexibleTime,
       currency: bookings.currency,
       totalCents: bookings.totalCents,
+      /*
+       * Both stamps are part of every transition's decision, not extras. Status
+       * alone can't tell a confirm that a refund is already in flight — that is
+       * what `cancelledAt` records — and `confirmedAt` is what separates a
+       * partially-refunded booking still waiting on a coordinator from one whose
+       * session is going ahead.
+       */
+      confirmedAt: bookings.confirmedAt,
+      completedAt: bookings.completedAt,
+      cancelledAt: bookings.cancelledAt,
     })
     .from(bookings)
     .where(eq(bookings.id, bookingId))
@@ -928,6 +1472,249 @@ async function lockBooking(tx: DbOrTx, bookingId: string) {
   }
 
   return { ...booking, ...context };
+}
+
+// ---------------------------------------------------------------------------
+// Outcome — what actually happened on the day
+// ---------------------------------------------------------------------------
+
+/**
+ * Records a confirmed session as `completed` or `no_show`.
+ *
+ * Nothing else writes either status or `completedAt`, so without this the state
+ * machine dead-ends at `confirmed`: no reconciliation can tell a session that
+ * happened from one nobody turned up to, and the `booking.no_show_refund` policy has
+ * nothing to apply to.
+ *
+ * Only from `confirmed`, because that is the only state in which a session was
+ * ever going to happen. **No payout is attempted.** The educator's accrual stays
+ * `accrued` until a settlement window passes — a chargeback can land 60–120 days
+ * later — and paying it out is a separate, deliberate act that this platform does
+ * not yet automate.
+ *
+ * Staff or the assigned educator, decided here against the booking rather than by
+ * the route: the person who taught the session is the one who knows what happened,
+ * and a coordinator recording it second-hand is the fallback, not the only path.
+ * Any other educator is answered as though the booking does not exist, so this
+ * can't be used to probe which bookings there are.
+ */
+export async function recordBookingOutcome(
+  bookingId: string,
+  input: BookingOutcomeRequest,
+  actor: AuthenticatedPrincipal,
+  ctx: RequestContext,
+): Promise<{ reference: string; status: BookingOutcomeRequest["outcome"] }> {
+  return db.transaction(async (tx) => {
+    const booking = await lockBooking(tx, bookingId);
+
+    if (!actor.isStaff) {
+      const profile = await educatorProfileForUser(actor.userId);
+      if (!profile || booking.assignedEducatorId !== profile.id) {
+        throw new AppError("not_found", "We couldn't find that booking.");
+      }
+      if (profile.verificationStatus !== "approved") {
+        throw new AppError(
+          "forbidden",
+          "Your background check needs to be current before you can record a session.",
+        );
+      }
+    }
+
+    if (booking.status !== "confirmed") {
+      throw new AppError(
+        "conflict",
+        `That booking is ${STATUS_WORDS[booking.status]}, so there's no outcome to record yet.`,
+      );
+    }
+
+    await tx
+      .update(bookings)
+      .set({ status: input.outcome, completedAt: new Date() })
+      .where(eq(bookings.id, bookingId));
+
+    await recordAudit(tx, {
+      actorId: actor.userId,
+      actorRole: actor.activeRole,
+      action: "booking.outcome_recorded",
+      entityType: "booking",
+      entityId: bookingId,
+      before: { status: booking.status },
+      after: { status: input.outcome, note: input.note ?? null },
+      ip: ctx.ip,
+      requestId: ctx.requestId,
+    });
+
+    return { reference: booking.reference, status: input.outcome };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Parent cancellation
+// ---------------------------------------------------------------------------
+
+/**
+ * The parent cancels their own session.
+ *
+ * This is the endpoint behind the sentence printed beside the pay button: cancel
+ * `booking.cancellation_window_hours` or more before the session and the refund is
+ * full and automatic. This is the only reader of that setting, so the promise beside
+ * the pay button is kept here or nowhere — which is also why the setting is admin-only
+ * and why the public snapshot carries the same number the checkout page prints.
+ *
+ * Inside the window it is **refused**, with the policy stated and a route to a
+ * person, rather than silently downgraded to a partial refund a parent didn't ask
+ * for. A late cancellation is a judgement about who absorbs the cost, and
+ * `refundBooking` is where a human makes that call.
+ *
+ * There is no `cancelled` status, deliberately: the money is what changed, so the
+ * refund path's own `refunded` is the honest end state. As everywhere else the
+ * money moves at Stripe and `charge.refunded` records it, so a parent's
+ * cancellation is bookkept exactly like a coordinator's refund.
+ */
+export async function cancelBookingByParent(
+  bookingId: string,
+  input: CancelBookingRequest,
+  principal: AuthenticatedPrincipal,
+  ctx: RequestContext,
+): Promise<{ reference: string; refundedCents: number }> {
+  const profile = await requireCustomerProfile(principal.userId);
+  const { cancellationWindowHours } = (await getEffectiveConfig()).booking;
+
+  const prepared = await db.transaction(async (tx) => {
+    const booking = await lockBooking(tx, bookingId);
+
+    // Not-yours and not-found answer identically, so this can't be used to probe
+    // which booking ids exist.
+    if (booking.customerProfileId !== profile.id) {
+      throw new AppError("not_found", "We couldn't find that booking.");
+    }
+
+    if (booking.cancelledAt) {
+      throw new AppError("conflict", "That booking is already being refunded.");
+    }
+
+    /*
+     * Only the two states where a session is still ahead of the parent. A
+     * `pending_payment` booking has nothing to give back, and everything past
+     * `confirmed` is a session that already happened or already resolved.
+     */
+    if (booking.status !== "paid_unconfirmed" && booking.status !== "confirmed") {
+      throw new AppError(
+        "conflict",
+        `That booking is ${STATUS_WORDS[booking.status]}, so there's nothing to cancel.`,
+      );
+    }
+
+    const startsAt = civilInstant(booking.preferredDate, booking.preferredTime);
+
+    if (!startsAt) {
+      /*
+       * A stored slot that won't resolve predates the validation in
+       * `createBooking`. Refuse rather than guess: the guess decides whether a
+       * family gets their money back.
+       */
+      throw new AppError(
+        "conflict",
+        "We can't work out when this session starts. Please contact us and we'll " +
+          "sort the refund out for you.",
+        { logContext: { bookingId, preferredDate: booking.preferredDate } },
+      );
+    }
+
+    const hoursAway = hoursUntil(startsAt);
+
+    if (hoursAway < cancellationWindowHours) {
+      throw new AppError(
+        "conflict",
+        `Free cancellation closes ${cancellationWindowHours} hours before ` +
+          "the session, and this one is inside that window. Reply to your confirmation " +
+          "email and a person will look at it with you.",
+      );
+    }
+
+    const [payment] = await tx
+      .select({
+        id: payments.id,
+        stripePaymentIntentId: payments.stripePaymentIntentId,
+        amountReceivedCents: payments.amountReceivedCents,
+        amountRefundedCents: payments.amountRefundedCents,
+      })
+      .from(payments)
+      .where(and(eq(payments.bookingId, bookingId), gt(payments.amountReceivedCents, 0)))
+      .orderBy(desc(payments.createdAt))
+      .limit(1);
+
+    if (!payment?.stripePaymentIntentId) {
+      throw new AppError(
+        "conflict",
+        "We haven't recorded a settled payment on this booking yet. Please try again " +
+          "in a few minutes, or contact us.",
+      );
+    }
+
+    const refundCents = payment.amountReceivedCents - payment.amountRefundedCents;
+
+    if (refundCents <= 0) {
+      throw new AppError("conflict", "This booking has already been refunded in full.");
+    }
+
+    // Written now, so the coordinator queue stops offering a decision on a
+    // booking the parent has withdrawn — the same stamp `cannotConfirmBooking`
+    // uses, and the reason `confirmBooking` checks it.
+    await tx
+      .update(bookings)
+      .set({ cancelledAt: new Date() })
+      .where(eq(bookings.id, bookingId));
+
+    await recordAudit(tx, {
+      actorId: principal.userId,
+      actorRole: principal.activeRole,
+      action: "booking.cancelled_by_parent",
+      entityType: "booking",
+      entityId: bookingId,
+      before: { status: booking.status },
+      after: {
+        refundCents,
+        reason: input.reason ?? null,
+        hoursBeforeSession: Math.round(hoursAway),
+        intentId: payment.stripePaymentIntentId,
+      },
+      ip: ctx.ip,
+      requestId: ctx.requestId,
+    });
+
+    return { booking, payment, refundCents };
+  });
+
+  await issueRefund({
+    bookingId,
+    intentId: prepared.payment.stripePaymentIntentId!,
+    // Whatever is left, decided by Stripe rather than by a figure we computed.
+    amountCents: null,
+    reason: input.reason ?? "Cancelled by the parent outside the cancellation window.",
+    issuedBy: principal.activeRole,
+    // One cancellation per booking — `cancelledAt` above is what makes that true,
+    // so the booking id is enough to make a retry the same refund.
+    keyParts: ["parent-cancel", bookingId],
+    ctx,
+  });
+
+  await trySend(
+    {
+      ...bookingRefundedTemplate({
+        parentName: prepared.booking.parentName,
+        reference: prepared.booking.reference,
+        reason: "You cancelled this session ahead of our cancellation window.",
+        refundedCents: prepared.refundCents,
+        currency: prepared.booking.currency,
+        partial: false,
+      }),
+      to: prepared.booking.parentEmail,
+    },
+    { purpose: "booking_refunded", userId: prepared.booking.parentUserId },
+  );
+
+  return { reference: prepared.booking.reference, refundedCents: prepared.refundCents };
 }
 
 // ---------------------------------------------------------------------------
@@ -1107,65 +1894,122 @@ export async function listEducatorAssignments(
 // SLA sweep
 // ---------------------------------------------------------------------------
 
+/** One query's worth of due bookings, and how many of those queries per run. */
+const SWEEP_PAGE_SIZE = 50;
+const SWEEP_MAX_PAGES = 20;
+
+/**
+ * The bookings whose confirmation deadline has passed and whose balance is still
+ * held.
+ *
+ * `paid_unconfirmed` is the ordinary case, and the partial index on
+ * `slaDeadline` covers it. `partially_refunded` with no confirm is the same
+ * situation with a goodwill refund already applied: the webhook overwrote the
+ * status, and leaving it out held the remaining balance past our own deadline
+ * with no auto-refund ever firing.
+ *
+ * `cancelledAt` is excluded because `cannotConfirmBooking` writes that stamp and
+ * leaves the status for `charge.refunded` to move — so between the two the
+ * booking still reads `paid_unconfirmed`, and every run would refund and email
+ * again.
+ */
+function dueForSweep(exclude: string[]) {
+  return and(
+    inArray(bookings.status, ["paid_unconfirmed", "partially_refunded"]),
+    isNull(bookings.confirmedAt),
+    isNull(bookings.cancelledAt),
+    lte(bookings.slaDeadline, new Date()),
+    exclude.length > 0 ? notInArray(bookings.id, exclude) : undefined,
+  );
+}
+
 /**
  * Refunds every paid booking whose confirmation deadline has passed.
  *
  * This is the promise behind taking money before anyone has agreed to teach:
  * `confirmationSlaDays` is a commitment, not a hope, and without this the money
- * sits indefinitely on a booking no coordinator ever worked. Driven by the
- * partial index on `slaDeadline`, so it stays one cheap query however many
- * bookings exist.
+ * sits indefinitely on a booking no coordinator ever worked.
+ *
+ * Worked in pages rather than one capped query. A single `limit(50)` silently
+ * left the fifty-first booking's money held with nothing in the response or the
+ * logs to say so — the failure mode of a promise-keeping job must never be
+ * "looked like it finished". A booking that fails stays due, so it is excluded
+ * from later pages by id rather than being met again forever, and hitting the
+ * page ceiling is an `error` with a count of what was left.
  *
  * Deliberately reuses `cannotConfirmBooking`, which means the sweep produces the
  * same refund, the same email and the same audit shape a coordinator's decision
  * does — the only difference being the actor.
  */
-export async function sweepUnconfirmedBookings(
-  ctx: RequestContext,
-): Promise<{ sweptIds: string[]; failed: { id: string; error: string }[] }> {
-  const due = await db
-    .select({ id: bookings.id, reference: bookings.reference })
-    .from(bookings)
-    .where(
-      and(eq(bookings.status, "paid_unconfirmed"), lte(bookings.slaDeadline, new Date())),
-    )
-    .orderBy(asc(bookings.slaDeadline))
-    .limit(50);
-
+export async function sweepUnconfirmedBookings(ctx: RequestContext): Promise<{
+  sweptIds: string[];
+  failed: { id: string; error: string }[];
+  /** Still past the deadline when the run stopped. Non-zero needs a human. */
+  remaining: number;
+}> {
   const sweptIds: string[] = [];
   const failed: { id: string; error: string }[] = [];
+  const seen: string[] = [];
+  let remaining = 0;
 
-  for (const booking of due) {
-    try {
-      await cannotConfirmBooking(
-        booking.id,
-        {
-          reason:
-            "We couldn't confirm an educator for this session within our confirmation window, " +
-            "so we've refunded it in full.",
-        },
-        SYSTEM_ACTOR,
-        ctx,
-      );
-      sweptIds.push(booking.id);
-    } catch (error) {
-      /*
-       * One booking failing must not strand the rest — a single un-refundable
-       * row (a dispute opened mid-sweep, a Stripe outage) would otherwise hold
-       * every later booking's money too.
-       */
-      const message = error instanceof Error ? error.message : String(error);
-      logger.error({ bookingId: booking.id, err: error }, "SLA sweep failed for booking");
-      failed.push({ id: booking.id, error: message });
+  for (let page = 0; page < SWEEP_MAX_PAGES; page += 1) {
+    const due = await db
+      .select({ id: bookings.id, reference: bookings.reference })
+      .from(bookings)
+      .where(dueForSweep(seen))
+      .orderBy(asc(bookings.slaDeadline))
+      .limit(SWEEP_PAGE_SIZE);
+
+    if (due.length === 0) break;
+
+    for (const booking of due) {
+      seen.push(booking.id);
+      try {
+        await cannotConfirmBooking(
+          booking.id,
+          {
+            reason:
+              "We couldn't confirm an educator for this session within our confirmation window, " +
+              "so we've refunded it in full.",
+          },
+          SYSTEM_ACTOR,
+          ctx,
+        );
+        sweptIds.push(booking.id);
+      } catch (error) {
+        /*
+         * One booking failing must not strand the rest — a single un-refundable
+         * row (a dispute opened mid-sweep, a Stripe outage) would otherwise hold
+         * every later booking's money too.
+         */
+        const message = error instanceof Error ? error.message : String(error);
+        logger.error({ bookingId: booking.id, err: error }, "SLA sweep failed for booking");
+        failed.push({ id: booking.id, error: message });
+      }
+    }
+
+    if (page === SWEEP_MAX_PAGES - 1) {
+      const [left] = await db
+        .select({ value: count() })
+        .from(bookings)
+        .where(dueForSweep(seen));
+      remaining = left?.value ?? 0;
+
+      if (remaining > 0) {
+        logger.error(
+          { remaining, swept: sweptIds.length, failed: failed.length },
+          "SLA sweep hit its page ceiling — bookings are still past their confirmation deadline",
+        );
+      }
     }
   }
 
   if (sweptIds.length > 0 || failed.length > 0) {
     logger.info(
-      { swept: sweptIds.length, failed: failed.length },
+      { swept: sweptIds.length, failed: failed.length, remaining },
       "SLA sweep finished",
     );
   }
 
-  return { sweptIds, failed };
+  return { sweptIds, failed, remaining };
 }

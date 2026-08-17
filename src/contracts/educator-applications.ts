@@ -38,7 +38,12 @@ export const submitEducatorApplicationSchema = z
 
 export type SubmitEducatorApplication = z.infer<typeof submitEducatorApplicationSchema>;
 
-/** Staff-facing view. `reviewNotes` is internal and never sent to an applicant. */
+/**
+ * Staff-facing view. `reviewNotes` is internal and never sent to an applicant.
+ *
+ * This is the allowlist the list and detail endpoints project to — the row also
+ * carries `updatedAt`, which nothing outside the database has a use for.
+ */
 export const educatorApplicationSchema = z.object({
   id: z.uuid(),
   applicantName: z.string(),
@@ -55,6 +60,8 @@ export const educatorApplicationSchema = z.object({
   createdAt: z.iso.datetime(),
 });
 
+export type EducatorApplication = z.infer<typeof educatorApplicationSchema>;
+
 export const listEducatorApplicationsQuerySchema = z
   .object({
     status: educatorApplicationStatusSchema.optional(),
@@ -62,6 +69,24 @@ export const listEducatorApplicationsQuerySchema = z
     offset: z.coerce.number().int().min(0).default(0),
   })
   .strict();
+
+/**
+ * Paged list. The queue is ordered newest-first, so without `total`/`hasMore` a
+ * caller that filters client-side cannot tell "no unreviewed applications" from
+ * "the unreviewed ones are past the window" — and the oldest, most overdue
+ * application is exactly the one that falls out of it.
+ */
+export const educatorApplicationListResponseSchema = z.object({
+  items: z.array(educatorApplicationSchema),
+  total: z.number().int(),
+  hasMore: z.boolean(),
+  limit: z.number().int(),
+  offset: z.number().int(),
+});
+
+export type EducatorApplicationListResponse = z.infer<
+  typeof educatorApplicationListResponseSchema
+>;
 
 export const reviewEducatorApplicationSchema = z
   .object({

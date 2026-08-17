@@ -73,6 +73,7 @@ export class SmtpEmailDriver implements EmailService {
         subject: message.subject,
         text: message.text,
         ...(message.html ? { html: message.html } : {}),
+        ...(message.replyTo ? { replyTo: message.replyTo } : {}),
       });
     } catch (error) {
       // The message and subject are safe to log; the body may contain a

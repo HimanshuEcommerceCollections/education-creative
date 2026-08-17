@@ -37,8 +37,15 @@ export async function recordAudit(tx: DbOrTx, entry: AuditEntry): Promise<void> 
 
 /**
  * Fire-and-forget variant for observations that must not fail the request they
- * describe — a failed login attempt, for instance. Logs loudly on failure so a
- * broken audit path is visible rather than silent.
+ * describe. Logs loudly on failure so a broken audit path is visible rather than
+ * silent.
+ *
+ * **Best-effort, not guaranteed.** On a serverless invocation the instance can
+ * freeze the moment the response completes, so a detached insert lands or doesn't
+ * depending on timing. Anything the schema or the docs describe as always recorded
+ * — logins, refusals, privileged actions — must therefore use `recordAudit` and
+ * await it; the auth paths do. Use this only where a missing row is genuinely
+ * acceptable.
  */
 export function recordAuditDetached(entry: AuditEntry): void {
   void recordAudit(db, entry).catch((error) => {

@@ -265,6 +265,9 @@ role instead:
 | GET | `/educator-applications` · `/:id` | staff |
 | PATCH | `/educator-applications/:id/review` | staff |
 | POST | `/educator-applications/:id/approve` | staff |
+| GET | `/config/snapshot` | public (allowlisted booking rules + feature flags) |
+| GET | `/config/admin` | staff (response filtered by role) |
+| POST | `/config/settings` | staff (per-setting role checked against the registry) |
 
 Every route returns the session **token in the response body**, never a cookie —
 cookie ownership belongs entirely to the Next BFF.
@@ -294,6 +297,22 @@ message strings:
 - **Approval is its own endpoint**, not a status value on `/review`, because it
   creates a user, grants a role, creates a profile, and sends an invite.
 - **Password reset revokes every session** for that account.
+- **Site configuration is a sparse KV table over a code registry.**
+  `config_settings` holds a row only where an admin has overridden a default, so
+  an empty table behaves exactly as the code did before the store existed, and
+  `src/config-registry.ts` is the single place a default is written down (it reads
+  them from `BOOKING_POLICY`). Three things follow, and all three are deliberate:
+  - **The contract carries no values.** `src/contracts/config.ts` is synced into
+    the web app and can reach a browser bundle, so it defines keys, shapes and
+    bounds only — the take rate and the margin floor live in the registry and
+    reach a caller only through the role-filtered admin endpoint.
+  - **Nothing here is effective-dated**, unlike the pricing tables beside it. A
+    quote freezes the take rate it was priced at (`quotes.take_rate_bps`, carried
+    onto the booking), so replaying an old charge never reads this table; history
+    is `audit_log`, which every write appends to before it commits.
+  - **Reads are memoised for 20 seconds per process.** A write clears the cache in
+    the instance that served it and other instances catch up within that window,
+    which is why the flags gate *entry points* and never anything irreversible.
 - **`audit_log` is append-only by intent but not yet by grant** — see below.
 
 ## Deviations from the architecture document

@@ -57,6 +57,7 @@ export class SesEmailDriver implements EmailService {
         new SendEmailCommand({
           FromEmailAddress: this.config.from,
           Destination: { ToAddresses: [message.to] },
+          ...(message.replyTo ? { ReplyToAddresses: [message.replyTo] } : {}),
           ...(this.config.configurationSetName
             ? { ConfigurationSetName: this.config.configurationSetName }
             : {}),
